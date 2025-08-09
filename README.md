@@ -62,3 +62,12 @@
 
 # # imgscraper for artists by artist: collecting references - download
           go to release and download .exe
+
+# # imgscraper for artists by artist: collecting references - knows bugs
+          Shutdown Behavior sometimes doesn't work as expected despite PSUTIL:
+
+          Check in the task manager that chrome / chromedriver processes are not left hanging. 
+          If everything is correct, they should end shortly after closing the application.
+
+          So my suggestion while exiting the program is in Filters tab press stopping browser and then exit the program.
+
