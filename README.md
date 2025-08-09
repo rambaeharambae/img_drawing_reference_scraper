@@ -1,4 +1,4 @@
-# imgscraper for artists from the artist: collecting references - description, features and dependencies
+# imgscraper for artists from the artist: parser - collecting references - description, features and dependencies
 
           Description:
             The program is designed for automatic parsing primarily references for artists, downloading and filtering them from:
@@ -54,7 +54,7 @@
 <img width="2214" height="1107" alt="image" src="https://github.com/user-attachments/assets/138987f3-81e2-4c28-b8f7-220147e492a4" />
 
 
-# # imgscraper for artists from the artist: collecting references - setup       
+# # imgscraper for artists from the artist: parser - collecting references - setup       
 
           1. clone the repository
              git clone https://github.com/rambaeharambae/img_drawing_reference_scraper.git
@@ -65,10 +65,10 @@
           4. build an .exe executable file
              pyinstaller --onefile --noconsole imgscraper.py
 
-# # imgscraper for artists by artist: collecting references - download
+# # imgscraper for artists by artist: parser - collecting references - download
           go to release and download .exe
 
-# # imgscraper for artists by artist: collecting references - knows bugs
+# # imgscraper for artists by artist: parser - collecting references - knows bugs
           Shutdown Behavior sometimes doesn't work as expected despite PSUTIL:
 
           Check in the task manager that chrome / chromedriver processes are not left hanging. 
@@ -77,5 +77,5 @@
           So my suggestion while exiting the program is — in Filters tab, press stopping browser and then exit the program.
 
           ---
-          If while scraping you get too much not what you wanted to scrape (heads instead of full body person) — change full-body ratio threshold or use additional requests or both.
+          If you get too much not what you wanted to parse (heads instead of full body person) — change full-body ratio threshold or use additional requests or both.
 
