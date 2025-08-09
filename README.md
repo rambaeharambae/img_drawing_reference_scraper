@@ -78,4 +78,5 @@
 
           ---
           If you get too much not what you wanted to parse (heads instead of full body person) — change full-body ratio threshold or use additional requests or both.
-
+          ---
+          The first launch could be long if you're missing some dependencies.
