@@ -76,3 +76,6 @@
 
           So my suggestion while exiting the program is — in Filters tab, press stopping browser and then exit the program.
 
+          ---
+          If while scraping you get too much not what you wanted to scrape (heads instead of full body person) — change full-body ratio threshold or use additional requests or both.
+
