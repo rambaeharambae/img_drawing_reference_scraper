@@ -1,4 +1,4 @@
-# imgscraper for artists by artist: collecting references for artists - description, features and dependencies
+# imgscraper for artists from the artist: collecting references for artists - description, features and dependencies
 
           Description:
             The program is designed for automatic parsing primarily references for artists, downloading and filtering them from:
@@ -40,7 +40,7 @@
             - imagehash
             - ultralitycs
 
-# imgscraper for artists by artist: collecting references for artists - setup       
+# imgscraper for artists from the artist: collecting references for artists - setup       
 
           1. clone the repository
              git clone https://github.com/rambaeharambae/img_drawing_reference_scraper.git
