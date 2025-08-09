@@ -1,0 +1,9 @@
+PyQt5
+selenium
+webdriver-manager
+icrawler
+Pillow
+requests
+beautifulsoup4
+ImageHash
+ultralytics    # Optional, only if you want YOLO object detection
