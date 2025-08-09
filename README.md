@@ -53,7 +53,7 @@
 <img width="2214" height="1107" alt="image" src="https://github.com/user-attachments/assets/138987f3-81e2-4c28-b8f7-220147e492a4" />
 
 
-# imgscraper for artists from the artist: collecting references - setup       
+# # imgscraper for artists from the artist: collecting references - setup       
 
           1. clone the repository
              git clone https://github.com/rambaeharambae/img_drawing_reference_scraper.git
