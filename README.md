@@ -50,6 +50,8 @@
 
 <img width="983" height="602" alt="image" src="https://github.com/user-attachments/assets/49611aa5-0796-4b0f-9575-c005f8fd849f" />
 
+<img width="2214" height="1107" alt="image" src="https://github.com/user-attachments/assets/138987f3-81e2-4c28-b8f7-220147e492a4" />
+
 
 # imgscraper for artists from the artist: collecting references - setup       
 
