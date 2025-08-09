@@ -67,7 +67,7 @@
           Shutdown Behavior sometimes doesn't work as expected despite PSUTIL:
 
           Check in the task manager that chrome / chromedriver processes are not left hanging. 
-          If everything is correct, they should end shortly after closing the application.
+          If everything is correct, they should end shortly after closing the application and webdriver\selenium, but it doesn't.
 
-          So my suggestion while exiting the program is in Filters tab press stopping browser and then exit the program.
+          So my suggestion while exiting the program is — in Filters tab, press stopping browser and then exit the program.
 
