@@ -1,4 +1,4 @@
-# imgscraper for artists from the artist: collecting references for artists - description, features and dependencies
+# imgscraper for artists from the artist: collecting references - description, features and dependencies
 
           Description:
             The program is designed for automatic parsing primarily references for artists, downloading and filtering them from:
@@ -40,7 +40,16 @@
             - imagehash
             - ultralitycs
 
-# imgscraper for artists from the artist: collecting references for artists - setup       
+<img width="975" height="476" alt="image" src="https://github.com/user-attachments/assets/8b966e21-a61f-4394-8506-ab993ec5819b" />
+
+<img width="976" height="473" alt="image" src="https://github.com/user-attachments/assets/287a014d-3287-4823-b564-0a649a30ba2a" />
+
+<img width="974" height="475" alt="image" src="https://github.com/user-attachments/assets/34adabe1-781b-416c-b1f0-fd04b069570e" />
+
+<img width="983" height="602" alt="image" src="https://github.com/user-attachments/assets/49611aa5-0796-4b0f-9575-c005f8fd849f" />
+
+
+# imgscraper for artists from the artist: collecting references - setup       
 
           1. clone the repository
              git clone https://github.com/rambaeharambae/img_drawing_reference_scraper.git
@@ -51,5 +60,5 @@
           4. build an .exe executable file
              pyinstaller --onefile --noconsole imgscraper.py
 
-# # imgscraper for artists by artist: collecting references for artists - download
+# # imgscraper for artists by artist: collecting references - download
           go to release and download .exe
