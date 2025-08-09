@@ -24,7 +24,7 @@
             Notes:
             - All files are saved with unique names (date/time + random tail)
             - The history of downloaded URLs can be reset via the menu
-
+            - Could be ported to Linux\macOS but I don't give a shit 
             Logic developer and tester: Hara
             Developed and wrote the code: ChatGPT
 
