@@ -88,3 +88,5 @@
           If you get too much not what you wanted to parse (heads instead of full body person) — change full-body ratio threshold or use additional requests or both.
           ---
           The first launch could be long if you're missing some dependencies.
+          ---
+          The file size is big as f cuz its --onefile with full dependencies + webdrivermanager - working with optimizations, will be another release soon
