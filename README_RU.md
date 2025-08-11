@@ -30,9 +30,6 @@
     • Полная рандомизация поиска при парсинге
 
     Примечания:
-    - Все файлы сохраняются с уникальными именами (дата/время + случайный хвост)
-    - Историю загруженных URL-адресов можно сбросить через меню
-    - Можно портировать на Linux\macOS, но мне всё равно
     - Первый запуск может быть долгим из-за отсутсвия некоторых зависимых библиотек на устройстве (по типу YOLO\WebDriver-manager)
 
     Разработчик логики и тестировщик: Hara
@@ -50,18 +47,10 @@
     - imagehash
     - ultralitycs
 
-    
-<img width="975" height="476" alt="image" src="https://github.com/user-attachments/assets/8b966e21-a61f-4394-8506-ab993ec5819b" />
-
-<img width="976" height="473" alt="image" src="https://github.com/user-attachments/assets/287a014d-3287-4823-b564-0a649a30ba2a" />
-
-<img width="974" height="475" alt="image" src="https://github.com/user-attachments/assets/34adabe1-781b-416c-b1f0-fd04b069570e" />
-
-<img width="974" height="655" alt="image" src="https://github.com/user-attachments/assets/74aa1c0f-cfea-43f7-90f6-a1b9cd32dbd6" />
-
-<img width="983" height="602" alt="image" src="https://github.com/user-attachments/assets/49611aa5-0796-4b0f-9575-c005f8fd849f" />
-
-<img width="2214" height="1107" alt="image" src="https://github.com/user-attachments/assets/138987f3-81e2-4c28-b8f7-220147e492a4" />
+<img width="1185" height="591" alt="image" src="https://github.com/user-attachments/assets/c2e6399b-6ddb-4df7-bfe8-ab9a58a5b997" />
+<img width="1182" height="600" alt="image" src="https://github.com/user-attachments/assets/24622bbe-906c-46e6-b48b-0135a3635919" />
+<img width="1228" height="601" alt="image" src="https://github.com/user-attachments/assets/ec7b705a-2a5d-4286-b225-98e47d68cabb" />
+<img width="1226" height="596" alt="image" src="https://github.com/user-attachments/assets/8c77b11c-a7d6-4a60-915f-d524a24b321f" />
 
 # # imgscraper для художников от художника: парсер - сбор референсов - установка 
 
@@ -80,11 +69,6 @@
 
 # # imgscraper для художников от художника: парсер - сбор референсов - известные баги
 
-    Функция завершения работы программы иногда работает не так, как ожидалось, несмотря на PSUTIL:
-    Проверь в диспетчере задач, не зависли ли процессы Chrome/ChromeDriver.
-    Если всё ок, они должны завершиться вскоре после закрытия приложения и Chrome/ChromeDriver, но этого иногда не происходит.
-    Поэтому при выходе из программы: во вкладке «Filters» нажми «Stop browser» и затем выйди из программы.
-    --
     Если ищется хрень с тем, что хотели (головы вместо человека в полный рост), измените пороговое значение threshold тела или используй Additional req., или и то, и другое.
     --
     Первый запуск может быть долгим, если отсутствуют какие-либо зависимости (читай примечания).
