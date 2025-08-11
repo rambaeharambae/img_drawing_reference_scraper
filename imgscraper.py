@@ -1,140 +1,57 @@
+# imgscraper.py
+"""
+ImgScraper — Updated with fixes requested:
+1) Restored and expanded POSE_TERMS to include many original categories.
+2) Improved Google/Bing parsing when given search queries (builds search URLs and parses results).
+3) Improved Pinterest parsing (more robust tab handling, scrolling, logging).
+4) Debug/logging: many more INFO/DEBUG logs emitted so Debug tab shows background actions (enqueue, saved, driver start/stop).
+5) Ensured threads receive task-specific params (pages, imgs_per_page).
+6) Proper closeEvent kept; lazy imports preserved.
+
+Replace your current imgscraper.py with this file.
+"""
+from pathlib import Path
 import os
 import sys
 import json
 import time
-import random
 import logging
-
-#LOGGING
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
-
-
-from pathlib import Path
-from datetime import datetime
-from urllib.parse import quote_plus
-import re
-
-import requests
-from bs4 import BeautifulSoup
-from PIL import Image, UnidentifiedImageError, ImageStat
-
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QSpinBox, QProgressBar, QCheckBox, QGridLayout, QGroupBox,
-    QTabWidget, QComboBox, QFileDialog, QMessageBox, QAction, QLineEdit, QTextEdit, QDoubleSpinBox
-)
-
-#PSUTIL иначе хуита полностью не закроется и останется в памяти
-import psutil
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.spawned_pids = []
-
-    def launch_browser(self):
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
-        # Сохраняем PID chromedriver
-        if driver.service.process:
-            self.spawned_pids.append(driver.service.process.pid)
-        # Сохраняем PID самого Chrome (дети chromedriver)
-        try:
-            p = psutil.Process(driver.service.process.pid)
-            for child in p.children(recursive=True):
-                self.spawned_pids.append(child.pid)
-        except psutil.NoSuchProcess:
-            pass
-        self.driver = driver
-
-    def closeEvent(self, event):
-        # Закрываем драйвер
-        try:
-            self.driver.quit()
-        except:
-            pass
-        # Убиваем все сохранённые PID
-        for pid in self.spawned_pids:
-            try:
-                p = psutil.Process(pid)
-                p.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        # Делаем жёсткий kill для упрямых
-        for pid in self.spawned_pids:
-            try:
-                p = psutil.Process(pid)
-                if p.is_running():
-                    p.kill()
-            except psutil.NoSuchProcess:
-                pass
-        super().closeEvent(event)
-
-
-#IMAGEHASH
-
 import threading
+import queue
+import requests
+import shutil
+import atexit
+import signal
+import random
+import re
+from urllib.parse import quote_plus
+from icrawler.builtin import GoogleImageCrawler, BingImageCrawler
+
+# PyQt imports
 try:
-    import imagehash
-except Exception:
-    imagehash = None
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+        QPushButton, QTextEdit, QLabel, QLineEdit, QFileDialog, QCheckBox,
+        QSpinBox, QGroupBox, QFormLayout, QComboBox, QTabWidget, QProgressBar,
+        QAction, QMessageBox, QDialog, QDoubleSpinBox, QScrollArea
+    )
+    from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+except Exception as e:
+    raise RuntimeError("PyQt5 is required. Install via `pip install PyQt5`.") from e
 
-#DIALOGUE
+# Logging setup
+LOG = logging.getLogger("imgscraper")
+LOG.setLevel(logging.INFO)
+if not LOG.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    LOG.addHandler(_h)
 
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton
-
-# icrawler (Google/Bing)
-try:
-    from icrawler.builtin import GoogleImageCrawler, BingImageCrawler
-except Exception:
-    GoogleImageCrawler = None
-    BingImageCrawler = None
-    logging.warning("icrawler not available; Google/Bing will be disabled if missing.")
-
-from icrawler.downloader import ImageDownloader
-class CustomNameDownloader(ImageDownloader):
-    def get_filename(self, task, default_ext):
-        from datetime import datetime
-        # default_ext может быть ".jpg" или "jpg" — нормализуем
-        if not default_ext.startswith("."):
-            ext = f".{default_ext}"
-        else:
-            ext = default_ext
-        return f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{random_nonce(6)}{ext}"
-
-# YOLO support optional
-try:
-    from ultralytics import YOLO
-    HAS_YOLO = True
-except Exception:
-    YOLO = None
-    HAS_YOLO = False
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Qt logging handler — отправляет записи логов в GUI через сигнал
-class QtLogHandler(logging.Handler, QObject):
-    log_signal = pyqtSignal(str)
-
-    def __init__(self):
-        logging.Handler.__init__(self)
-        QObject.__init__(self)
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            # emit to connected Qt slot
-            self.log_signal.emit(msg)
-        except Exception:
-            # защищённо — не ломаем основной поток логов
-            pass
-
-# Defaults
-DEFAULT_SAVE_FOLDER = str(Path.cwd() / "icrawl_results")
+# --- Constants and defaults ---
+APP_DIR = Path.home() / ".imgscraper"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = APP_DIR / "config.json"
+DEFAULT_SAVE_FOLDER = str(Path.cwd() / "downloads")
 DEFAULT_SETTINGS = {
     "save_folder": DEFAULT_SAVE_FOLDER,
     "count_per_category": 30,
@@ -142,27 +59,29 @@ DEFAULT_SETTINGS = {
     "imgs_per_page": 10,
     "feeder_threads": 1,
     "downloader_threads": 4,
-    "min_size": (200, 200),
+    "min_size": (400, 400),
+    "use_google": True,
+    "use_bing": False,
+    "use_pinterest": True,
     "pinterest_headless": True,
-    # new defaults
+    "pinterest_full_res": False,
+    "dup_detection": False,
+    "dup_threshold": 0.8,
+    "dup_action": "delete_new",
     "use_yolo": False,
     "yolo_conf": 0.45,
-    "yolo_crop": False,
     "yolo_model": "yolov8n.pt",
+    "yolo_crop": False,
     "full_body_only": False,
     "full_body_ratio": 0.8,
     "only_bw": False,
-    "custom_queries": "",
-    "use_custom_only": False,
-    "append_custom": False,
-    "include_domains": "",
-    "exclude_domains": ""
+    "strong_random": False,
+    "sketch_mode": False,
+    "genders": ["man", "woman", "boy", "girl"],
+    "poses": []
 }
 
-# Settings file
-CONFIG_PATH = Path.home() / ".icrawl_gui_settings.json"
-
-# Simple pose vocabulary (kept same)
+# Expanded pose terms (restored / extended)
 POSE_TERMS = [
     "standing", "sitting", "kneeling", "crouching", "lying down",
     "walking", "running", "jumping", "stretching", "dancing",
@@ -172,989 +91,1030 @@ POSE_TERMS = [
     "attack pose", "martial arts pose", "yoga pose", "balance pose",
     "falling pose", "contrapposto", "gesture line", "silhouette study",
     "thumbnail sketch", "figure study", "anatomy breakdown", "value study",
-    "line of action", "composition study", "negative space pose"
+    "line of action", "composition study", "negative space pose",
+    "sexy pose", "cute pose", "holding object pose", "dance pose" 
 ]
 
-# Helpers ---------------------------------------------------------------------
-
-def ensure_folder(path):
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def is_image_file(path):
-    return os.path.splitext(path)[1].lower() in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
-
-#FULLIMGPINTEREST
-def parse_srcset_get_largest(srcset: str):
-    """Возвращает URL с наибольшим разрешением из srcset (или None)."""
-    if not srcset:
-        return None
-    # srcset: "url1 236w, url2 474w, url3 736w"
-    parts = [p.strip() for p in srcset.split(',') if p.strip()]
-    best = None
-    best_w = 0
-    for p in parts:
-        seg = p.rsplit(' ', 1)
-        if len(seg) == 2:
-            url, w = seg
-            try:
-                wv = int(w.rstrip('w'))
-            except Exception:
-                wv = 0
-            if wv > best_w:
-                best_w = wv
-                best = url.strip()
-        else:
-            # только URL без суффикса
-            url = seg[0]
-            if not best:
-                best = url.strip()
-    return best
-
-def get_full_image_from_pin(driver, pin_href, timeout=4.0):
-    """
-    Открывает pin_href во временной вкладке и пытается извлечь больший (full-res)
-    URL картинки — ищем meta[property='og:image'] или largest src/srcset на странице.
-    Возвращает URL или None. Не уничтожает driver.
-    """
-    if not driver:
-        return None
-    try:
-        current = driver.current_window_handle
-    except Exception:
-        current = None
-
-    try:
-        # открыть в новой вкладке и перейти туда
-        driver.execute_script("window.open(arguments[0], '_blank');", pin_href)
-        WebDriverWait(driver, timeout).until(lambda d: len(d.window_handles) >= 1)
-        driver.switch_to.window(driver.window_handles[-1])
-        time.sleep(0.8)
-
-        # попробуем meta og:image
-        try:
-            meta = driver.find_element("xpath", "//meta[@property='og:image']")
-            if meta:
-                content = meta.get_attribute("content")
-                if content:
-                    return content
-        except Exception:
-            pass
-
-        # пробуем найти картинки и их srcset -> взять наибольший
-        try:
-            imgs = driver.find_elements("tag name", "img")
-            best = None
-            best_w = 0
-            for img in imgs:
-                try:
-                    ss = img.get_attribute("srcset") or ""
-                    if ss:
-                        cand = parse_srcset_get_largest(ss)
-                        if cand:
-                            # грубо оценим 'w' из srcset (если нет, пропускаем)
-                            # просто возвращаем первый найденный
-                            return cand
-                    src = img.get_attribute("src") or ""
-                    if src and "pinimg" in src:
-                        # fallback
-                        return src
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    except Exception as e:
-        logging.debug("get_full_image_from_pin error: %s", e)
-    finally:
-        # закрой вкладку и вернись
-        try:
-            if driver and len(driver.window_handles) > 1:
-                # закрываем последнюю вкладку, затем переключаемся на предыдущую
-                driver.close()
-                if current:
-                    driver.switch_to.window(current)
-        except Exception:
-            pass
-    return None
-#FULLIMGPINTEREST
-
-
-
-def random_nonce(n=6):
-    import string
-    return ''.join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=n))
-
+# helper functions
 def slugify(s):
-    s = s.strip().lower()
-    s = re.sub(r'[^a-z0-9]+', '_', s)
-    s = re.sub(r'_+', '_', s)
-    return s.strip('_')[:80]
-
-# Per-folder seen_urls functions ----------------------------------------------
-
-def load_seen_urls(folder):
-    #"""Load seen_urls.json from folder. Return set of URLs."""
-    try:
-        seen_file = os.path.join(folder, "seen_urls.json")
-        if os.path.exists(seen_file):
-            with open(seen_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return set(data)
-        return set()
-    except Exception as e:
-        logging.debug("load_seen_urls error for %s: %s", folder, e)
-        return set()
-
-def append_seen_urls(folder, new_urls):
-    #"""Append new URLs into seen_urls.json placed inside folder."""
-    try:
-        seen_file = os.path.join(folder, "seen_urls.json")
-        existing = set()
-        if os.path.exists(seen_file):
-            try:
-                with open(seen_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        existing = set(data)
-            except Exception:
-                existing = set()
-        merged = existing.union(set(new_urls or []))
-        with open(seen_file, "w", encoding="utf-8") as f:
-            json.dump(list(merged), f, ensure_ascii=False, indent=2)
-        logging.info("append_seen_urls: saved %d urls to %s (+%d new)", len(merged), seen_file, len(merged) - len(existing))
-    except Exception as e:
-        logging.error("append_seen_urls error for %s: %s", folder, e)
-
-# Query builder ---------------------------------------------------------------
+    s = re.sub(r"[^\w\s-]", "", s).strip().lower()
+    s = re.sub(r"[-\s]+", "_", s)
+    return s[:120]
 
 def build_random_query(gender, pose, sketch_mode=False, strong_random=False):
     base = f"{gender} {pose}"
+    extras = []
     if sketch_mode:
-        base += " sketch drawing lineart reference"
-    else:
-        base += " photo reference"
-    extras = [
-        "full body","gesture drawing","dynamic","anatomy","foreshortening",
-        "perspective","art reference","action pose","lighting study",
-        "dramatic angle","composition","contrapposto","silhouette study",
-        "line of action","figure study","thumbnail sketch","value study",
-        "motion study","reference sheet","model sheet","negative space",
-        "croquis","life drawing"
-    ]
+        extras.append("sketch")
     if strong_random:
-        choose = random.sample(extras, k=random.randint(2, 3))
-        base += " " + " ".join(choose)
-    else:
-        if random.random() < 0.6:
-            base += " " + random.choice(extras)
-    base += " " + random_nonce(4)
-    return base.strip()
+        extras.append(random.choice(["dramatic lighting", "dynamic pose", "studio", "outdoor"]))
+    if extras:
+        return base + " " + " ".join(extras)
+    return base
 
-# YOLO wrapper ---------------------------------------------------------------
+# ---------------------------
+# Seen management
+# ---------------------------
+def ensure_folder(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def load_seen(folder: str):
+    p = Path(folder)
+    p.mkdir(parents=True, exist_ok=True)
+    urls, files, hashes = set(), set(), {}
+    try:
+        f = p / "seen_urls.json"
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8") or "[]")
+            if isinstance(data, list):
+                urls.update([str(x) for x in data])
+    except Exception:
+        LOG.debug("load_seen: failed loading seen_urls", exc_info=True)
+    try:
+        f = p / "seen_files.json"
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8") or "[]")
+            if isinstance(data, list):
+                files.update([str(x) for x in data])
+    except Exception:
+        LOG.debug("load_seen: failed loading seen_files", exc_info=True)
+    try:
+        f = p / "seen_hashes.json"
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict):
+                hashes.update(data)
+    except Exception:
+        LOG.debug("load_seen: failed loading seen_hashes", exc_info=True)
+    return urls, files, hashes
+
+def append_seen(folder: str, urls=None, filenames=None, hashes=None):
+    folder_p = Path(folder)
+    folder_p.mkdir(parents=True, exist_ok=True)
+    urls = set(urls or [])
+    filenames = set(filenames or [])
+    hashes = dict(hashes or {})
+    try:
+        f = folder_p / "seen_urls.json"
+        existing = set(json.loads(f.read_text(encoding="utf-8") or "[]")) if f.exists() else set()
+        merged = sorted(list(existing.union(urls)))
+        f.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        LOG.debug("append_seen: failed write seen_urls", exc_info=True)
+    try:
+        f = folder_p / "seen_files.json"
+        existing = set(json.loads(f.read_text(encoding="utf-8") or "[]")) if f.exists() else set()
+        merged = sorted(list(existing.union(filenames)))
+        f.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        LOG.debug("append_seen: failed write seen_files", exc_info=True)
+    try:
+        f = folder_p / "seen_hashes.json"
+        existing = json.loads(f.read_text(encoding="utf-8") or "{}") if f.exists() else {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(hashes)
+        f.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        LOG.debug("append_seen: failed write seen_hashes", exc_info=True)
+
+# ---------------------------
+# Browser/process helper
+# ---------------------------
+import psutil
+class BrowserPidHelper:
+    def __init__(self):
+        self._pids = set()
+        self._drivers = []
+        self._lock = threading.Lock()
+        atexit.register(self.cleanup)
+        try:
+            signal.signal(signal.SIGINT, self._on_signal)
+            signal.signal(signal.SIGTERM, self._on_signal)
+        except Exception:
+            pass
+
+    def add_pid(self, pid):
+        with self._lock:
+            try:
+                self._pids.add(int(pid))
+            except Exception:
+                pass
+
+    def add_driver(self, driver):
+        with self._lock:
+            self._drivers.append(driver)
+
+    def _on_signal(self, signum, frame):
+        LOG.info("Signal %s received, cleaning up", signum)
+        self.cleanup()
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
+
+    def cleanup(self):
+        with self._lock:
+            for d in list(self._drivers):
+                try:
+                    getattr(d, "quit", lambda: None)()
+                except Exception:
+                    try:
+                        getattr(d, "close", lambda: None)()
+                    except Exception:
+                        pass
+            self._drivers.clear()
+            for pid in list(self._pids):
+                try:
+                    p = psutil.Process(pid)
+                    if p.is_running():
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            self._pids.clear()
+
+BROWSER_HELPER = BrowserPidHelper()
+
+# ---------------------------
+# Basic downloader
+# ---------------------------
+def download_image_basic(url: str, dest_path: str, timeout=20, headers=None):
+    headers = headers or {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36"}
+    try:
+        with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
+            r.raise_for_status()
+            tmp = dest_path + ".part"
+            with open(tmp, "wb") as fh:
+                shutil.copyfileobj(r.raw, fh)
+            os.replace(tmp, dest_path)
+        LOG.info("Downloaded %s", dest_path)
+        return True
+    except Exception:
+        LOG.debug("download_image_basic failed for %s", url, exc_info=True)
+        try:
+            if os.path.exists(dest_path + ".part"):
+                os.remove(dest_path + ".part")
+        except Exception:
+            pass
+        return False
+
+class DownloaderThread(threading.Thread):
+
+    def __init__(self, jobs_q: queue.Queue, out_folder: str, seen_folder: str, stop_event=None):
+        super().__init__(daemon=True)
+        self.jobs_q = jobs_q
+        self.out_folder = Path(out_folder)
+        self.seen_folder = Path(seen_folder)
+        self.stop_event = stop_event or threading.Event()
+        self._batch_urls = set()
+        self._batch_files = set()
+        self._batch_hashes = {}
+        self._flush_interval = 2.0
+        self._last_flush = time.time()
+
+    def run(self):
+        LOG.info("Downloader started")
+        # load seen once
+        self.seen_urls, self.seen_files, self.seen_hashes = load_seen(str(self.seen_folder))
+
+        def _resolve_existing_path(existing_name):
+            # try direct path
+            try:
+                p = Path(existing_name)
+                if p.exists():
+                    return p
+            except Exception:
+                pass
+            # try under out_folder
+            try:
+                candidate = self.out_folder / existing_name
+                if candidate.exists():
+                    return candidate
+            except Exception:
+                pass
+            # fallback: search by basename under out_folder (rare, possibly slow)
+            basename = os.path.basename(existing_name)
+            for root, dirs, files in os.walk(str(self.out_folder)):
+                if basename in files:
+                    return Path(root) / basename
+            return None
+
+        while not self.stop_event.is_set():
+            try:
+                job = self.jobs_q.get(timeout=0.5)
+            except queue.Empty:
+                self._periodic_flush()
+                continue
+            except Exception:
+                LOG.exception("Unexpected error getting job from queue")
+                self._periodic_flush()
+                continue
+
+            try:
+                url = job.get("url")
+                dest = Path(job.get("dest"))
+                meta = job.get("meta", {}) or {}
+                dest.parent.mkdir(parents=True, exist_ok=True)
+
+                # quick seen check: support both legacy filename-only and full-path entries
+                if (url and url in self.seen_urls) or (dest.name in self.seen_files) or (str(dest) in self.seen_files):
+                    LOG.debug("Downloader: skipping known %s", url or dest.name)
+                    try:
+                        self.jobs_q.task_done()
+                    except Exception:
+                        pass
+                    continue
+
+                ok = download_image_basic(url, str(dest))
+
+                if ok:
+                    # size guard
+                    try:
+                        if os.path.getsize(dest) < 10240:
+                            os.remove(dest)
+                            LOG.info("Deleted too small file %s", dest)
+                            ok = False
+                    except Exception:
+                        LOG.warning("Failed to check file size for %s", dest, exc_info=True)
+
+                    # Black & White conversion if requested
+                    if ok and meta.get("only_bw", False):
+                        try:
+                            from PIL import Image
+                            img = Image.open(dest).convert("L")
+                            img.save(dest)
+                            LOG.info("Applied B/W filter to %s", dest)
+                        except Exception as e:
+                            LOG.warning("Failed to apply B/W filter to %s: %s", dest, e)
+
+                if not ok:
+                    LOG.debug("Failed to download %s", url)
+                    try:
+                        self.jobs_q.task_done()
+                    except Exception:
+                        pass
+                    self._periodic_flush()
+                    continue
+
+                # compute perceptual hash if requested (for duplicate detection)
+                phash = None
+                if meta.get("compute_hash", False):
+                    try:
+                        from PIL import Image
+                        import imagehash
+                        phash = str(imagehash.phash(Image.open(dest)))
+                    except Exception:
+                        LOG.debug("hash computation failed for %s", dest, exc_info=True)
+
+                # duplicate handling via pHash if enabled
+                if meta.get("dup_detection", False) and phash:
+                    try:
+                        import imagehash
+                        # compute bit-length from current phash
+                        bits = len(phash) * 4
+                        similarity = float(meta.get("dup_threshold", 0.8))
+                        max_dist = int((1.0 - max(0.0, min(1.0, similarity))) * bits)
+                        is_dup = False
+                        dup_existing_key = None
+                        dup_existing_value = None
+                        for existing_hex, existing_value in list(self.seen_hashes.items()):
+                            try:
+                                ha = imagehash.hex_to_hash(existing_hex)
+                                hb = imagehash.hex_to_hash(phash)
+                                dist = ha - hb
+                            except Exception:
+                                dist = sum(c1 != c2 for c1, c2 in zip(existing_hex, phash))
+                            if dist <= max_dist:
+                                is_dup = True
+                                dup_existing_key = existing_hex
+                                dup_existing_value = existing_value
+                                break
+
+                        if is_dup:
+                            action = str(meta.get("dup_action", "delete_new"))
+                            LOG.info("Duplicate detected (action=%s): %s ~ %s", action, dest.name, dup_existing_value)
+                            if action == "delete_new":
+                                try:
+                                    os.remove(dest)
+                                except Exception:
+                                    pass
+                                ok = False
+                            elif action == "replace_existing" and dup_existing_value:
+                                try:
+                                    # dup_existing_value may be full path or filename.
+                                    existing_path = _resolve_existing_path(dup_existing_value)
+                                    if existing_path and existing_path.exists():
+                                        try:
+                                            os.remove(existing_path)
+                                            LOG.info("Removed existing duplicate: %s", existing_path)
+                                        except Exception:
+                                            LOG.debug("Failed to remove existing duplicate %s", existing_path, exc_info=True)
+                                    # remove mapping entry
+                                    try:
+                                        del self.seen_hashes[dup_existing_key]
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    LOG.debug("Failed replace_existing cleanup", exc_info=True)
+                                # ok remains True; new file will be recorded
+                            elif action == "keep_both":
+                                LOG.info("Keeping both duplicates: %s", dest.name)
+                            else:
+                                LOG.debug("Unknown dup action %s", action)
+                    except Exception:
+                        LOG.debug("Duplicate detection error for %s", dest, exc_info=True)
+
+                # finalize saved file bookkeeping
+                if ok:
+                    LOG.info("Saved %s", dest)
+                    if url:
+                        self.seen_urls.add(url)
+                        self._batch_urls.add(url)
+                    self.seen_files.add(dest.name)
+                    self._batch_files.add(dest.name)
+                    if phash:
+                        # store full path for hashes (so replace_existing can find the file)
+                        self.seen_hashes[phash] = str(dest)
+                        self._batch_hashes[phash] = str(dest)
+                else:
+                    LOG.debug("File removed/ignored after download: %s", dest)
+
+            except Exception:
+                LOG.exception("Error in downloader job processing")
+            finally:
+                try:
+                    self.jobs_q.task_done()
+                except Exception:
+                    pass
+                self._periodic_flush()
+
+        # final flush on stop
+        try:
+            self._flush_all()
+        except Exception:
+            LOG.exception("Error during final flush in downloader")
+        LOG.info("Downloader stopped")
+
+    def _periodic_flush(self):
+        if (
+            time.time() - self._last_flush >= self._flush_interval
+            and (self._batch_urls or self._batch_files or self._batch_hashes)
+        ):
+            self._flush_all()
+            self._last_flush = time.time()
+
+    def _flush_all(self):
+        try:
+        
+            if not (self._batch_urls or self._batch_files or self._batch_hashes):
+                return
+        
+            if self._batch_urls or self._batch_files or self._batch_hashes:
+                append_seen(
+                    str(self.seen_folder),
+                    urls=self._batch_urls,
+                    filenames=self._batch_files,
+                    hashes=self._batch_hashes
+                )
+                LOG.debug(
+                    "Flushed seen: %d urls, %d files, %d hashes",
+                    len(self._batch_urls),
+                    len(self._batch_files),
+                    len(self._batch_hashes)
+                )
+            self._batch_urls.clear()
+            self._batch_files.clear()
+            self._batch_hashes.clear()
+        except Exception:
+            LOG.exception("Failed to flush seen")
+
+    def stop(self, wait=True):
+        self.stop_event.set()
+        if wait:
+            self.join(timeout=5)
+
+# ---------------------------
+# Filters (lazy imports)
+# ---------------------------
+class BWFilter:
+    def __init__(self, sat_threshold=20):
+        self.sat_threshold = sat_threshold
+
+    def is_blackwhite(self, image_path):
+        try:
+            from PIL import Image, ImageStat
+            im = Image.open(image_path).convert("RGB")
+            hsv = im.convert("HSV")
+            stat = ImageStat.Stat(hsv)
+            avg_s = stat.mean[1]
+            return avg_s <= self.sat_threshold
+        except Exception:
+            LOG.debug("BWFilter failed for %s", image_path, exc_info=True)
+            return False
+
+class PHashFilter:
+    def __init__(self, dist_threshold=8):
+        self.dist_threshold = dist_threshold
+
+    def compute_hash(self, image_path):
+        try:
+            from PIL import Image
+            import imagehash
+            return str(imagehash.phash(Image.open(image_path)))
+        except Exception:
+            LOG.debug("PHash compute failed for %s", image_path, exc_info=True)
+            return None
+
+    def is_duplicate(self, hash_str, seen_hashes):
+        if not hash_str:
+            return False
+        try:
+            import imagehash
+            for existing in seen_hashes.keys():
+                try:
+                    ha = imagehash.hex_to_hash(existing)
+                    hb = imagehash.hex_to_hash(hash_str)
+                    dist = ha - hb
+                except Exception:
+                    dist = sum(c1 != c2 for c1, c2 in zip(existing, hash_str))
+                if dist <= self.dist_threshold:
+                    return True
+            return False
+        except Exception:
+            for existing in seen_hashes.keys():
+                dist = sum(c1 != c2 for c1, c2 in zip(existing, hash_str))
+                if dist <= self.dist_threshold:
+                    return True
+            return False
 
 class YOLOFilter:
     def __init__(self, model_name="yolov8n.pt", conf=0.45):
-        if not HAS_YOLO:
-            raise RuntimeError("ultralytics not installed")
-        # allow either local path or pretrained name
-        self.model = YOLO(model_name)
+        self.model_name = model_name
         self.conf = conf
+        self._model = None
 
-    def get_person_boxes(self, path):
-        boxes_out = []
+    def _ensure_model(self):
+        if self._model is None:
+            try:
+                from ultralytics import YOLO
+                self._model = YOLO(self.model_name)
+            except Exception as e:
+                raise RuntimeError("YOLO not available or model not found: " + str(e))
+
+    def has_person(self, image_path):
         try:
-            results = self.model.predict(path, conf=self.conf, verbose=False)
+            self._ensure_model()
+            if self._model is None:
+                return False
+            results = self._model.predict(image_path, conf=self.conf, verbose=False)
             for r in results:
-                if not hasattr(r, "boxes"):
+                boxes = getattr(r, "boxes", None)
+                if boxes is None:
                     continue
                 try:
-                    xy = getattr(r.boxes, "xyxy").tolist()
-                    cls = getattr(r.boxes, "cls").tolist()
+                    cls_list = getattr(boxes, "cls").tolist()
                 except Exception:
-                    continue
-                for box, clsidx in zip(xy, cls):
-                    idx = int(clsidx)
-                    name = r.names[idx] if idx in r.names else ""
-                    if name == "person" or name.lower() == "person" or name.lower().startswith("person"):
-                        x1, y1, x2, y2 = [int(v) for v in box]
-                        boxes_out.append((x1, y1, x2, y2))
-        except Exception as e:
-            logging.debug("YOLO detect error: %s", e)
-        return boxes_out
-
-# Image utilities ------------------------------------------------------------
-
-def is_grayscale_image(img, sample_size=1000, tolerance=6):
-    """Detect if an image is grayscale.
-    - Fast sampling: resize to small resolution then sample pixels.
-    - tolerance: average absolute difference between channels allowed."""
-    try:
-        if img.mode in ("L", "LA"):
-            return True
-        # convert to RGB to be sure
-        rgb = img.convert("RGB")
-        # resize to speed up
-        small = rgb.resize((100, 100))
-        pixels = list(small.getdata())
-        total_diff = 0
-        n = 0
-        # sample up to sample_size pixels
-        step = max(1, len(pixels) // min(len(pixels), sample_size))
-        for i in range(0, len(pixels), step):
-            r, g, b = pixels[i]
-            total_diff += abs(r - g) + abs(r - b) + abs(g - b)
-            n += 1
-        if n == 0:
+                    try:
+                        cls_list = list(boxes.cls)
+                    except Exception:
+                        cls_list = []
+                names = getattr(r, "names", {})
+                for idx in cls_list:
+                    try:
+                        idx = int(idx)
+                        lab = names.get(idx, "") if isinstance(names, dict) else str(idx)
+                        if str(lab).lower().startswith("person"):
+                            return True
+                    except Exception:
+                        continue
             return False
-        avg_diff = total_diff / (n * 3.0)
-        return avg_diff <= tolerance
-    except Exception as e:
-        logging.debug("grayscale detect error: %s", e)
-        return False
-
-def load_image_hash_index(folder):
-    idx_file = os.path.join(folder, "image_hashes.json")
-    if os.path.exists(idx_file):
-        try:
-            with open(idx_file, "r", encoding="utf-8") as f:
-                return json.load(f)
         except Exception:
-            return {}
-    return {}
+            LOG.debug("YOLO has_person error for %s", image_path, exc_info=True)
+            return False
+# ---------------------------
+# Scraper threads
+# ---------------------------
+class BaseScraperThread(threading.Thread):
 
-def save_image_hash_index(folder, index):
-    idx_file = os.path.join(folder, "image_hashes.json")
-    try:
-        with open(idx_file, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    def __init__(self, query_or_url, jobs_q, out_folder, seen_folder, task_meta=None, downloader_meta=None, stop_event=None, logger=None):
+        super().__init__(daemon=True)
+        self.query_or_url = query_or_url
+        self.jobs_q = jobs_q
+        self.out_folder = out_folder
+        self.seen_folder = seen_folder
+        self.task_meta = task_meta or {}
+        self.downloader_meta = downloader_meta or {}
+        self.stop_event = stop_event or threading.Event()
+        self.logger = logger or LOG
 
-def compute_image_phash(path):
-    """Возвращает hex-строку pHash или None."""
-    if imagehash is None:
-        return None
-    try:
-        img = Image.open(path).convert("RGB")
-        h = imagehash.phash(img)
-        return str(h)  # hex
-    except Exception as e:
-        logging.debug("compute_image_phash error %s: %s", path, e)
-        return None
+    def _enqueue(self, url, suggested_name=None):
+        fname = suggested_name or os.path.basename(url.split("?")[0]) or f"img_{int(time.time()*1000)}.jpg"
+        dest = str(Path(self.out_folder) / fname)
+        job = {"url": url, "dest": dest, "meta": self.downloader_meta}
+        self.jobs_q.put(job)
+        self.logger.info("Enqueued %s -> %s", url, dest)
 
-def is_similar_hash(hex_a, hex_b, threshold=0.8):
-    """
-    hex strings -> сравниваем как ImageHash объекты, возвращаем True если похожи >= threshold.
-    """
-    try:
-        ha = imagehash.hex_to_hash(hex_a)
-        hb = imagehash.hex_to_hash(hex_b)
-        dist = ha - hb  # hamming distance (int)
-        max_bits = ha.hash.size  # обычно 64
-        sim = 1.0 - float(dist) / float(max_bits)
-        return sim, dist
-    except Exception:
-        # если что-то пошло не так — не считать дубликатом
-        return 0.0, None
+    def stop(self):
+        self.stop_event.set()
+
+class GoogleScraperThread(BaseScraperThread):
+    def run(self):
+        self.logger.info("GoogleScraper started for %s", self.query_or_url)
+        try:
+            pages = int(self.task_meta.get("pages", 1))
+            imgs_per_page = int(self.task_meta.get("imgs_per_page", 20))
+            max_results = int(self.task_meta.get("count", pages * imgs_per_page))
+
+            crawler = GoogleImageCrawler(
+                feeder_threads=1,
+                parser_threads=1,
+                downloader_threads=1,  # обязательно >=1 чтобы не было DummyDownloader
+                storage={'root_dir': None}
+            )
+
+            found = []
+
+            def enqueue_only(task, *args, **kwargs):
+                # robust URL extraction
+                url = task.get('file_url') or task.get('url') or task.get('file_urls')
+                if not url:
+                    return
+                # already reached required count
+                if len(found) >= max_results:
+                    return
+                # quick seen check from disk (fresh)
+                seen_urls, seen_files, _ = load_seen(str(self.seen_folder))
+                if (url and url in seen_urls) or (os.path.basename(url).split("?")[0] in seen_files):
+                    LOG.debug("Google: skipping seen %s", url)
+                    return
+                # optional head request size check (<10KB)
+                '''
+                try:
+                    r = requests.head(url, allow_redirects=True, timeout=5)
+                    size = int(r.headers.get('Content-Length', 0) or 0)
+                    if size and size < 10240:
+                        LOG.info("Skipped too small file (<10KB): %s", url)
+                        return
+                except Exception:
+                    LOG.debug("Could not check size for %s", url, exc_info=True)
+                    '''
+                found.append(url)
+                LOG.info("Google found/enqueue: %s", url)
+                self._enqueue(url)
+
+            # Подменяем стандартный метод загрузки на свой
+            crawler.downloader.download = enqueue_only
+
+            # Запуск без сохранения на диск — только сбор URL
+            crawler.crawl(keyword=self.query_or_url, max_num=max_results, filters=None)
+
+        except Exception:
+            self.logger.exception("GoogleScraper error")
+
+        self.logger.info("GoogleScraper finished for %s", self.query_or_url)
 
 
-# Worker Thread ---------------------------------------------------------------
+class BingScraperThread(BaseScraperThread):
+    def run(self):
+        self.logger.info("BingScraper started for %s", self.query_or_url)
+        try:
+            pages = int(self.task_meta.get("pages", 1))
+            imgs_per_page = int(self.task_meta.get("imgs_per_page", 20))
+            max_results = int(self.task_meta.get("count", pages * imgs_per_page))
 
+            crawler = BingImageCrawler(
+                feeder_threads=1,
+                parser_threads=1,
+                downloader_threads=1,  # нужен >=1, иначе DummyDownloader
+                storage={'root_dir': None}
+            )
+            
+            found = []
+
+            def enqueue_only(task, *args, **kwargs):
+                # robust URL extraction
+                url = task.get('file_url') or task.get('url') or task.get('file_urls')
+                if not url:
+                    return
+                # already reached required count
+                if len(found) >= max_results:
+                    return
+                # quick seen check from disk (fresh)
+                seen_urls, seen_files, _ = load_seen(str(self.seen_folder))
+                if (url and url in seen_urls) or (os.path.basename(url).split("?")[0] in seen_files):
+                    LOG.debug("Bing: skipping seen %s", url)
+                    return
+                # optional head request size check (<10KB)
+                '''
+                try:
+                    r = requests.head(url, allow_redirects=True, timeout=5)
+                    size = int(r.headers.get('Content-Length', 0) or 0)
+                    if size and size < 10240:
+                        LOG.info("Skipped too small file (<10KB): %s", url)
+                        return
+                except Exception:
+                    LOG.debug("Could not check size for %s", url, exc_info=True)
+                    '''
+                found.append(url)
+                LOG.info("Bing found/enqueue: %s", url)
+                self._enqueue(url)
+
+            # Подменяем стандартный метод загрузки на свой
+            crawler.downloader.download = enqueue_only
+
+            # Запуск без сохранения на диск — только сбор URL
+            crawler.crawl(keyword=self.query_or_url, max_num=max_results, filters=None)
+
+        except Exception:
+            self.logger.exception("BingScraper error")
+
+        self.logger.info("BingScraper finished for %s", self.query_or_url)
+
+
+class PinterestScraperThread(BaseScraperThread):
+    def __init__(
+        self,
+        query_or_url,
+        jobs_q,
+        out_folder,
+        seen_folder,
+        task_meta=None,
+        downloader_meta=None,
+        stop_event=None,
+        logger=None,
+        headless=True,
+        imgs_per_page=10
+    ):
+        super().__init__(query_or_url, jobs_q, out_folder, seen_folder,
+                         task_meta=task_meta, downloader_meta=downloader_meta,
+                         stop_event=stop_event, logger=logger)
+        self.headless = headless
+        self.driver = None
+        self.imgs_per_page = imgs_per_page
+
+    def _start_driver(self):
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.service import Service
+            from selenium.webdriver.chrome.options import Options
+            from webdriver_manager.chrome import ChromeDriverManager
+        except Exception as e:
+            raise RuntimeError("Selenium/webdriver_manager required: " + str(e))
+
+        opts = Options()
+
+        # Headless
+        if self.headless:
+            try:
+                opts.add_argument('--headless=new')
+            except Exception:
+                opts.add_argument('--headless')
+
+        # Минимальное окно
+        opts.add_argument("--window-size=800,600")
+
+        # Отключение изображений для ускорения загрузки страниц
+        prefs = {"profile.managed_default_content_settings.images": 2}
+        opts.add_experimental_option("prefs", prefs)
+
+        # Прочие оптимизации
+        opts.add_argument('--no-sandbox')
+        opts.add_argument('--disable-dev-shm-usage')
+        opts.add_argument('--log-level=3')
+        opts.add_argument('--disable-gpu')
+        opts.add_argument('--disable-extensions')
+
+        driver_path = ChromeDriverManager().install()
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=opts)
+        driver.implicitly_wait(3)
+
+        BROWSER_HELPER.add_driver(driver)
+        try:
+            if getattr(service, "process", None) and hasattr(service.process, "pid"):
+                BROWSER_HELPER.add_pid(service.process.pid)
+        except Exception:
+            pass
+
+        self.driver = driver
+        return driver
+
+
+    def run(self):
+        self.logger.info("PinterestScraper started for %s", self.query_or_url)
+        try:
+            driver = self._start_driver()
+            target = self.query_or_url
+            if not target.startswith("http"):
+                from requests.utils import requote_uri
+                q = requote_uri(self.query_or_url)
+                target = f"https://www.pinterest.com/search/pins/?q={q}"
+            self.logger.info("Pinterest: opening %s", target)
+            driver.get(target)
+            time.sleep(1.2)
+
+            collected = []
+            scroll_attempts = 0
+            
+            target_count = int(self.task_meta.get("count") or self.task_meta.get("imgs_per_page") or 20)
+            max_scrolls = max(10, int(target_count / self.imgs_per_page) * 5)
+            while not self.stop_event.is_set() and len(collected) < target_count and scroll_attempts < max_scrolls:
+                try:
+                    thumbs = driver.find_elements("css selector", "a[href*='/pin/']")
+                    for el in thumbs:
+                        try:
+                            href = el.get_attribute("href")
+                            if href and href not in collected:
+                                collected.append(href)
+                        except Exception:
+                            continue
+                    driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                    time.sleep(0.8)
+                    scroll_attempts += 1
+                except Exception:
+                    LOG.debug("Pinterest scroll iteration error", exc_info=True)
+                    time.sleep(0.5)
+            self.logger.info("Pinterest: collected %d pin links", len(collected))
+
+            enqueued = 0
+            for pin_url in list(collected)[:target_count]:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    before = list(driver.window_handles)
+                    cur_handle = driver.current_window_handle
+                    driver.execute_script("window.open(arguments[0]);", pin_url)
+                    new_handle = None
+                    wait_start = time.time()
+                    while time.time() - wait_start < 6:
+                        after = list(driver.window_handles)
+                        new = [h for h in after if h not in before]
+                        if new:
+                            new_handle = new[0]
+                            break
+                        time.sleep(0.15)
+                    if new_handle:
+                        driver.switch_to.window(new_handle)
+                    else:
+                        driver.get(pin_url)
+                    time.sleep(0.8)
+                    imgs = driver.find_elements("css selector", "img")
+                    img_url = None
+                    for im in imgs:
+                        try:
+                            s = im.get_attribute("src")
+                            if not s:
+                                s = im.get_attribute("data-src") or im.get_attribute("data-original") or im.get_attribute("srcset")
+                            if s and "pinimg" in s:
+                                img_url = s
+                                break
+                            if s and s.startswith("http") and any(ext in s for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                                if not img_url:
+                                    img_url = s
+                        except Exception:
+                            continue
+                    if img_url:
+                        self._enqueue_with_min_size_check(img_url)
+                        enqueued += 1
+                    if new_handle:
+                        driver.close()
+                        driver.switch_to.window(cur_handle)
+                except Exception:
+                    LOG.debug("Pinterest per-pin handling error", exc_info=True)
+                    try:
+                        if len(driver.window_handles) > 1:
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+                    except Exception:
+                        pass
+            self.logger.info("PinterestScraper enqueued %d items", enqueued)
+        except Exception:
+            self.logger.exception("PinterestScraper failed")
+        self.logger.info("PinterestScraper finished for %s", self.query_or_url)
+    
+    def _enqueue_with_min_size_check(self, url):
+        try:
+            import requests
+            r = requests.head(url, allow_redirects=True, timeout=5)
+            size = int(r.headers.get('Content-Length', 0))
+            if size < 10240:
+                LOG.info("Skipped too small file (<10KB): %s", url)
+                return
+        except Exception:
+            LOG.debug("Could not check size for %s", url, exc_info=True)
+        self._enqueue(url)
+
+# ---------------------------
+# ScraperThread QThread orchestrator
+# ---------------------------
 class ScraperThread(QThread):
     status_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
     done_signal = pyqtSignal()
 
-    def __init__(self, config):
+    def __init__(self, cfg):
         super().__init__()
-        self.config = config or {}
-        self._stop = False
-        self.session = requests.Session()
-        self._tmp_drivers = []
-        self._tmp_drivers_lock = threading.Lock()
-        self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17 Safari/605.1.15",
-            "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/115.0"
-        ]
-        # YOLO
-        self.yolo = None
-        if self.config.get("use_yolo", False) and HAS_YOLO:
-            try:
-                self.yolo = YOLOFilter(model_name=self.config.get("yolo_model", "yolov8n.pt"),
-                                       conf=self.config.get("yolo_conf", 0.45))
-            except Exception as e:
-                logging.warning("YOLO init failed: %s", e)
-                self.yolo = None
-
-    def stop(self):
-        self._stop = True
-        # close HTTP session to unblock any ongoing requests
-        try:
-            self.session.close()
-        except Exception:
-            pass
-        # try to quit any temporary webdriver instances created by this thread
-        try:
-            with getattr(self, '_tmp_drivers_lock', threading.Lock()):
-                for _d in list(getattr(self, '_tmp_drivers', []) or []):
-                    try:
-                        _d.quit()
-                    except Exception:
-                        try:
-                            _d.close()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    def _download_and_save(self, url, folder):
-        """Download single url to folder; return filename or None."""
-        if self._stop:
-            return None
-        try:
-            headers = {"User-Agent": random.choice(self.user_agents)}
-            r = self.session.get(url, headers=headers, timeout=15, stream=True)
-            if r.status_code == 200:
-                # try to infer extension
-                ext = "jpg"
-                ct = r.headers.get("content-type", "")
-                if "png" in ct:
-                    ext = "png"
-                fn = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{random_nonce(5)}.{ext}"
-                path = os.path.join(folder, fn)
-                with open(path, "wb") as f:
-                    for chunk in r.iter_content(1024):
-                        if self._stop:
-                            return None
-                        if chunk:
-                            f.write(chunk)
-                return fn
-        except Exception as e:
-            logging.debug("Download error %s -> %s", url, e)
-        return None
-        
-    def _download_and_save_url(self, url, folder):
-        """
-        Скачивает по URL и сохраняет с уникальным именем (timestamp + random + корректное расширение).
-        Возвращает имя файла либо None.
-        """
-        if self._stop:
-            return None
-        try:
-            headers = {"User-Agent": random.choice(self.user_agents)}
-            r = self.session.get(url, headers=headers, timeout=20, stream=True)
-            if r.status_code == 200:
-                ct = r.headers.get("content-type", "").lower()
-                # попытаемся определить расширение
-                ext = ".jpg"
-                if "png" in ct:
-                    ext = ".png"
-                elif "jpeg" in ct or "jpg" in ct:
-                    ext = ".jpg"
-                elif "webp" in ct:
-                    ext = ".webp"
-                elif "gif" in ct:
-                    ext = ".gif"
-                fn = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{random_nonce(6)}{ext}"
-                path = os.path.join(folder, fn)
-                with open(path, "wb") as f:
-                    for chunk in r.iter_content(1024 * 8):
-                        if self._stop:
-                            return None
-                        if chunk:
-                            f.write(chunk)
-                return fn
-        except Exception as e:
-            logging.debug("Download error %s -> %s", url, e)
-        return None
-
-
-    def _handle_new_file(self, folder, fn):
-        """Handle duplicate detection and indexing for a newly saved file 'fn' inside 'folder'."""
-        
-        path = os.path.join(folder, fn)
-        try:
-            if os.path.getsize(path) < 10 * 1024:  # 10 KB
-                logging.info("Low quality image removed: %s (less than 10KB)", fn)
-                os.remove(path)
-                return  # не продолжаем обработку
-        except Exception as e:
-            logging.warning("Failed to check file size %s: %s", fn, e)
-            return
-
-        # далее старая логика: pHash, проверка дубликатов и т.д.
-        
-        try:
-            if not self.config.get("dup_detection", False):
-                # still update index if imagehash missing? we skip
-                return
-            if imagehash is None:
-                logging.info("imagehash not installed; skipping duplicate detection.")
-                return
-            idx = load_image_hash_index(folder)
-            new_path = os.path.join(folder, fn)
-            if not os.path.exists(new_path):
-                return
-            new_hash = compute_image_phash(new_path)
-            if not new_hash:
-                # cannot compute hash; just add placeholder
-                idx[fn] = None
-                save_image_hash_index(folder, idx)
-                return
-            best_sim = 0.0
-            best_existing = None
-            for ex_name, ex_hash in list(idx.items()):
-                if not ex_hash:
-                    continue
-                sim, dist = is_similar_hash(new_hash, ex_hash, float(self.config.get("dup_threshold", 0.8)))
-                if sim is None:
-                    continue
-                if sim >= float(self.config.get("dup_threshold", 0.8)) and sim > best_sim:
-                    best_sim = sim
-                    best_existing = ex_name
-            action = self.config.get("dup_action", "delete_new")
-            if best_existing:
-                logging.info("Duplicate detected: %s ~ %s (sim=%.3f)", fn, best_existing, best_sim)
-                if action == "delete_new":
-                    try:
-                        os.remove(new_path)
-                        logging.info("Removed duplicate new file: %s", new_path)
-                    except Exception as e:
-                        logging.debug("Error removing new dup: %s", e)
-                elif action == "replace_existing":
-                    try:
-                        existing_path = os.path.join(folder, best_existing)
-                        if os.path.exists(existing_path):
-                            os.remove(existing_path)
-                        # rename new to existing name
-                        os.rename(new_path, existing_path)
-                        idx[best_existing] = new_hash
-                        save_image_hash_index(folder, idx)
-                        logging.info("Replaced %s with %s", best_existing, fn)
-                    except Exception as e:
-                        logging.debug("Error replacing existing: %s", e)
-                else:
-                    # keep both
-                    idx[fn] = new_hash
-                    save_image_hash_index(folder, idx)
-            else:
-                idx[fn] = new_hash
-                save_image_hash_index(folder, idx)
-        except Exception as e:
-            logging.debug("dup handler error: %s", e)
-    def _is_full_body_box(self, box, img_w, img_h, ratio_thresh=0.8, top_margin=0.18, bottom_margin=0.88):
-        x1, y1, x2, y2 = box
-        box_h = (y2 - y1)
-        h_ratio = box_h / float(max(1, img_h))
-        top_ok = (y1 <= img_h * top_margin)
-        bottom_ok = (y2 >= img_h * bottom_margin)
-        # Consider full body if height ratio is large and either top is near top or bottom near bottom
-        return (h_ratio >= ratio_thresh) and (top_ok or bottom_ok)
+        self.cfg = cfg.copy()
+        self._stop = threading.Event()
+        self._scrapers = []
+        self._jobs_q = queue.Queue()
 
     def run(self):
-        tasks = self.config.get("tasks", [])
-        total = len(tasks) or 1
+        try:
+            tasks = self.cfg.get("tasks", [])
+            if not tasks:
+                self.status_signal.emit("No tasks")
+                self.done_signal.emit()
+                return
+            self.status_signal.emit("Starting...")
+            # start downloader (single thread pool can be expanded)
+            downloader_threads = int(self.cfg.get("downloader_threads", 10))
+            
+            save_folder = self.cfg.get("save_folder", DEFAULT_SAVE_FOLDER)
+            self.seen_root = str(Path(save_folder) / ".seen")
+            ensure_folder(save_folder)
+            ensure_folder(self.seen_root)
+
+            downloader_stop = threading.Event()
+            downloader_threads = max(1, int(self.cfg.get("downloader_threads", 4)))
+            self._downloaders = []
+            for _ in range(downloader_threads):
+                d = DownloaderThread(self._jobs_q, save_folder, self.seen_root, stop_event=downloader_stop)
+                d.start()
+                self._downloaders.append(d)
+            
+            # partition tasks across feeder threads
+            feeder_threads = int(self.cfg.get("feeder_threads", 1))
+            chunks = [[] for _ in range(max(1, feeder_threads))]
+            for i, t in enumerate(tasks):
+                chunks[i % len(chunks)].append(t)
+            workers = []
+            for chunk in chunks:
+                wt = threading.Thread(target=self._process_task_chunk, args=(chunk,), daemon=True)
+                workers.append(wt)
+                wt.start()
+            # monitor workers
+            while any(w.is_alive() for w in workers):
+                if self._stop.is_set():
+                    break
+                time.sleep(0.5)
+            # wait until queue empty or stop
+            while not self._jobs_q.empty():
+                if self._stop.is_set():
+                    break
+                time.sleep(0.3)
+
+            # stop downloader
+            downloader_stop.set()
+            for d in getattr(self, "_downloaders", []):
+                try:
+                    d.stop(wait=True)
+                except Exception:
+                    pass
+
+            self.progress_signal.emit(100)
+            self.status_signal.emit("Completed")
+            self.done_signal.emit()
+
+        except Exception:
+            LOG.exception("ScraperThread run error")
+            self.status_signal.emit("Error")
+            self.done_signal.emit()
+
+    def _process_task_chunk(self, chunk):
+        total = len(chunk)
         done = 0
-
-        for task in tasks:
-            if self._stop:
+        for t in chunk:
+            if self._stop.is_set():
                 break
+            source = t.get("source")
+            query = t.get("query")
+            self.status_signal.emit(f"Processing {source}: {query}")
+            stop_ev = threading.Event()
+            task_meta = {"pages": t.get("pages", 1), "imgs_per_page": t.get("imgs_per_page", 10), "count": t.get("count", 30)}
+ # detailed downloader metadata passed into each enqueue job
+            downloader_meta = {
+                "compute_hash": bool(self.cfg.get("dup_detection", False)),
+                "dup_detection": bool(self.cfg.get("dup_detection", False)),
+                "dup_threshold": float(self.cfg.get("dup_threshold", 0.8)),
+                "dup_action": str(self.cfg.get("dup_action", "delete_new")),
+                "only_bw": bool(self.cfg.get("only_bw", False)),
+                "min_size": tuple(self.cfg.get("min_size", (200,200))),
+                "yolo": bool(self.cfg.get("use_yolo", False)),
+                "yolo_conf": float(self.cfg.get("yolo_conf", 0.45)),
+                "yolo_model": str(self.cfg.get("yolo_model", "yolov8n.pt")),
+                "yolo_crop": bool(self.cfg.get("yolo_crop", False))
+            }
 
-            source = task.get("source")
-            query = task.get("query")
-            folder = task.get("folder")
-            count = int(task.get("count", self.config.get("count_per_category", 30)))
-            pages_to_sample = int(task.get("pages", self.config.get("pages_per_task", 3)))
-            imgs_per_page = int(task.get("imgs_per_page", self.config.get("imgs_per_page", 10)))
-
-            ensure_folder(folder)
-            # load per-folder seen URLs
-            seen = load_seen_urls(folder)
-
-            self.status_signal.emit(f"{source.upper()}: {query}")
-            logging.info("Task: source=%s query='%s' folder=%s count=%s", source, query, folder, count)
-
-            # GOOGLE via icrawler
             if source == "google":
-                if GoogleImageCrawler is None:
-                    logging.error("GoogleImageCrawler not available.")
-                else:
-                    pages_list = list(range(0, 200, 50))
-                    sample_pages = random.sample(pages_list, k=min(pages_to_sample, len(pages_list)))
-
-                    target_new = count  # хотим столько новых файлов за запуск
-                    downloaded_new = 0  # уже скачано новых
-
-                    for offset in sample_pages:
-                        if self._stop or downloaded_new >= target_new:
-                            break
-                        try:
-                            page_num = offset // 50 + 1
-                            self.status_signal.emit(f"Google: page {page_num}")
-                            logging.info("Google crawl offset=%s", offset)
-
-                            before_files = set(os.listdir(folder))
-                            crawler = GoogleImageCrawler(
-                                storage={"root_dir": folder},
-                                feeder_threads=int(self.config.get("feeder_threads", 1)),
-                                downloader_threads=int(self.config.get("downloader_threads", 4)),
-                                downloader_cls=CustomNameDownloader
-                            )
-                            try:
-                                crawler.crawl(
-                                    keyword=query,
-                                    max_num=target_new - downloaded_new,
-                                    offset=offset
-                                )
-                            except TypeError:
-                                crawler.crawl(
-                                    keyword=query,
-                                    max_num=target_new - downloaded_new
-                                )
-
-                            after_files = set(os.listdir(folder))
-                            new_files = [
-                                f for f in (after_files - before_files)
-                                if is_image_file(os.path.join(folder, f))
-                            ]
-                            downloaded_new += len(new_files)
-                            # handle newly created files: update seen and run duplicate handler
-                            for _new_fn in new_files:
-                                try:
-                                    seen.add(_new_fn)
-                                    # write seen immediately
-                                    try:
-                                        with open(os.path.join(folder, "seen_urls.json"), "w", encoding="utf-8") as sf:
-                                            json.dump(list(seen), sf, ensure_ascii=False, indent=2)
-                                    except Exception as e:
-                                        logging.debug("Could not update seen_urls.json: %s", e)
-                                    # run duplicate detection/indexing
-                                    try:
-                                        self._handle_new_file(folder, _new_fn)
-                                    except Exception as e:
-                                        logging.debug("Error in dup handler for %s: %s", _new_fn, e)
-                                except Exception as e:
-                                    logging.debug("Error processing new file %s: %s", _new_fn, e)
-
-                        except Exception as e:
-                            logging.error("Google crawl error: %s", e)
-                            
-                            
-
-            # BING via icrawler
+                
+                th = GoogleScraperThread(
+                    query,
+                    self._jobs_q,
+                    t.get("folder"),
+                    self.seen_root,
+                    task_meta=task_meta,
+                    downloader_meta=downloader_meta,
+                    stop_event=stop_ev,
+                    logger=LOG
+                )
+                
             elif source == "bing":
-                if BingImageCrawler is None:
-                    logging.error("BingImageCrawler not available.")
-                else:
-                    pages_list = list(range(0, 200, 50))
-                    sample_pages = random.sample(pages_list, k=min(pages_to_sample, len(pages_list)))
-
-                    target_new = count  # хотим столько новых файлов за запуск
-                    downloaded_new = 0  # уже скачано новых
-
-                    for offset in sample_pages:
-                        if self._stop or downloaded_new >= target_new:
-                            break
-                        try:
-                            page_num = offset // 50 + 1
-                            self.status_signal.emit(f"Bing: page {page_num}")
-                            logging.info("Bing crawl offset=%s", offset)
-
-                            before_files = set(os.listdir(folder))
-                            crawler = BingImageCrawler(
-                                storage={"root_dir": folder},
-                                feeder_threads=int(self.config.get("feeder_threads", 1)),
-                                downloader_threads=int(self.config.get("downloader_threads", 4)),
-                                downloader_cls=CustomNameDownloader
-                            )
-                            try:
-                                crawler.crawl(
-                                    keyword=query,
-                                    max_num=target_new - downloaded_new,
-                                    offset=offset
-                                )
-                            except TypeError:
-                                crawler.crawl(
-                                    keyword=query,
-                                    max_num=target_new - downloaded_new
-                                )
-
-                            after_files = set(os.listdir(folder))
-                            new_files = [
-                                f for f in (after_files - before_files)
-                                if is_image_file(os.path.join(folder, f))
-                            ]
-                            downloaded_new += len(new_files)
-                            # handle newly created files: update seen and run duplicate handler
-                            for _new_fn in new_files:
-                                try:
-                                    seen.add(_new_fn)
-                                    # write seen immediately
-                                    try:
-                                        with open(os.path.join(folder, "seen_urls.json"), "w", encoding="utf-8") as sf:
-                                            json.dump(list(seen), sf, ensure_ascii=False, indent=2)
-                                    except Exception as e:
-                                        logging.debug("Could not update seen_urls.json: %s", e)
-                                    # run duplicate detection/indexing
-                                    try:
-                                        self._handle_new_file(folder, _new_fn)
-                                    except Exception as e:
-                                        logging.debug("Error in dup handler for %s: %s", _new_fn, e)
-                                except Exception as e:
-                                    logging.debug("Error processing new file %s: %s", _new_fn, e)
-
-                        except Exception as e:
-                            logging.error("Bing crawl error: %s", e)
-
-            # PINTEREST via Selenium (full res)
+                th = BingScraperThread(query, self._jobs_q, t.get("folder"), self.seen_root, task_meta=task_meta, downloader_meta=downloader_meta, stop_event=stop_ev, logger=LOG)
             elif source == "pinterest":
-                try:
-                    from selenium import webdriver
-                    from selenium.webdriver.chrome.service import Service
-                    from selenium.webdriver.chrome.options import Options
-                    from selenium.webdriver.common.by import By
-                    from webdriver_manager.chrome import ChromeDriverManager
-                except Exception as e:
-                    logging.error("Selenium/webdriver-manager not available: %s", e)
-                    self.status_signal.emit("Pinterest: selenium not installed")
-                    time.sleep(0.2)
-                    done += 1
-                    self.progress_signal.emit(int(done / total * 100))
-                    continue
-
-                # опции драйвера
-                chrome_options = Options()
-                if self.config.get("pinterest_headless", True):
-                    try:
-                        chrome_options.add_argument("--headless=new")
-                    except Exception:
-                        chrome_options.add_argument("--headless")
-                chrome_options.add_argument("--no-sandbox")
-                chrome_options.add_argument("--disable-dev-shm-usage")
-                chrome_options.add_argument("--log-level=3")
-                chrome_options.add_argument(f"user-agent={random.choice(self.user_agents)}")
-
-                # попытаться использовать уже открытый драйвер (передан в config)
-                driver = self.config.get("pinterest_driver", None)
-                driver_lock = self.config.get("pinterest_driver_lock", None)
-
-                def _acquire_driver():
-                    nonlocal driver
-                    # если драйвер передан и reuse включён — используем его
-                    if driver:
-                        return driver, driver_lock
-                    # иначе создаём временный локальный драйвер (он будет закрыт в finally)
-                    try:
-                        service = Service(ChromeDriverManager().install())
-                        tmp_driver = webdriver.Chrome(service=service, options=chrome_options)
-                        try:
-                            # track temporary drivers so we can quit them on stop()
-                            with getattr(self, '_tmp_drivers_lock', threading.Lock()):
-                                self._tmp_drivers.append(tmp_driver)
-                        except Exception:
-                            pass
-                        return tmp_driver, None
-                    except Exception as e:
-                        logging.error("Failed to start Chrome for Pinterest: %s", e)
-                        return None, None
-
-                tmp_created = False
-                driver_instance, lock = _acquire_driver()
-                if driver_instance is None:
-                    # не можем парсить Pinterest
-                    done += 1
-                    self.progress_signal.emit(int(done / total * 100))
-                    continue
-
-                try:
-                    if driver is None:
-                        tmp_created = True
-
-                    # sample pages
-                    page_choices = random.sample(range(1, 1 + max(1, pages_to_sample * 2)), k=pages_to_sample)
-                    for page in page_choices:
-                        if self._stop:
-                            break
-                        search_url = f"https://www.pinterest.com/search/pins/?q={quote_plus(query)}&page={page}"
-                        self.status_signal.emit(f"Pinterest: page {page}")
-                        logging.info("Pinterest open %s", search_url)
-                        try:
-                            # если есть lock — захватываем перед работой с драйвером
-                            if lock:
-                                lock.acquire()
-                            driver_instance.get(search_url)
-                        except Exception as e:
-                            logging.debug("Selenium get error: %s", e)
-                            if lock:
-                                lock.release()
-                            continue
-                        finally:
-                            if lock and lock.locked():
-                                # оставляем захваченный lock при навигации кратко (можно освободить)
-                                try:
-                                    lock.release()
-                                except Exception:
-                                    pass
-
-                        time.sleep(1.4)
-                        # скроллим
-                        last_h = driver_instance.execute_script("return document.body.scrollHeight")
-                        for _ in range(3):
-                            if self._stop:
-                                break
-                            driver_instance.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                            time.sleep(1.0)
-                            new_h = driver_instance.execute_script("return document.body.scrollHeight")
-                            if new_h == last_h:
-                                break
-                            last_h = new_h
-
-                        # собираем элементы <img>
-                        try:
-                            imgs = driver_instance.find_elements(By.TAG_NAME, "img")
-                        except Exception as e:
-                            logging.debug("Pinterest collect error: %s", e)
-                            imgs = []
-
-                        img_urls_candidates = []
-                        for img_el in imgs:
-                            try:
-                                srcset = img_el.get_attribute("srcset") or ""
-                                src = img_el.get_attribute("src") or ""
-                                # пробуем srcset -> largest
-                                best = parse_srcset_get_largest(srcset)
-                                if best:
-                                    img_urls_candidates.append((best, None))  # (url, pin_href)
-                                    continue
-                                if src and "pinimg" in src:
-                                    # возможно превью, но добавим как fallback
-                                    # также пытаемся найти ссылку на сам pin
-                                    try:
-                                        anchor = img_el.find_element(By.XPATH, "./ancestor::a[1]")
-                                        href = anchor.get_attribute("href") if anchor else None
-                                    except Exception:
-                                        href = None
-                                    img_urls_candidates.append((src, href))
-                            except Exception:
-                                continue
-
-                        random.shuffle(img_urls_candidates)
-                        take_n = min(len(img_urls_candidates), imgs_per_page)
-                        for cand, pin_href in img_urls_candidates[:take_n]:
-                            if self._stop:
-                                break
-                            # если опция full-res включена — пробуем получить полное изображение через pin page
-                            full_res_url = None
-                            if self.config.get("pinterest_full_res", False) and pin_href:
-                                try:
-                                    if lock:
-                                        lock.acquire()
-                                    full_res_url = get_full_image_from_pin(driver_instance, pin_href)
-                                except Exception as e:
-                                    logging.debug("Error getting full-res from pin: %s", e)
-                                finally:
-                                    if lock and lock.locked():
-                                        try:
-                                            lock.release()
-                                        except Exception:
-                                            pass
-
-                            # если не получилось — используем cand
-                            download_url = full_res_url or cand
-                            if not download_url:
-                                continue
-
-                            # логируем полный URL (в логах требуется видеть ссылки на full-res)
-                            logging.info("Pinterest FULL URL: %s (pin: %s)", download_url, pin_href)
-
-                            # domain include/exclude
-                            incl = task.get("include_domains") or self.config.get("include_domains") or ""
-                            excl = task.get("exclude_domains") or self.config.get("exclude_domains") or ""
-                            domain = ""
-                            try:
-                                domain = download_url.split('/')[2]
-                            except Exception:
-                                domain = ""
-                            if incl:
-                                ok = any(d.strip().lower() in domain.lower() for d in incl.split(','))
-                                if not ok:
-                                    logging.debug("Skipping %s - not in include domains", download_url)
-                                    continue
-                            if excl:
-                                if any(d.strip().lower() in domain.lower() for d in excl.split(',')):
-                                    logging.debug("Skipping %s - in exclude domains", download_url)
-                                    continue
-
-                            # пропускаем если уже в seen
-                            if download_url in seen:
-                                continue
-
-                            # скачиваем URL напрямую через requests (используем метод, который даёт уникальные имена)
-                            fn = None
-                            try:
-                                fn = self._download_and_save_url(download_url, folder)
-                            except Exception as e:
-                                logging.debug("Download from pinterest failed %s: %s", download_url, e)
-                                fn = None
-
-                            if fn:
-                                seen.add(download_url)
-                                logging.info("Pinterest saved %s (from %s)", fn, download_url)
-                                # write full urls log
-                                try:
-                                    with open(os.path.join(folder, "full_urls.log"), "a", encoding="utf-8") as lf:
-                                        lf.write(download_url + "\n")
-                                except Exception as e:
-                                    logging.debug("Could not write full_urls.log: %s", e)
-                                # update seen file with URLs
-                                try:
-                                    with open(os.path.join(folder, "seen_urls.json"), "w", encoding="utf-8") as sf:
-                                        json.dump(list(seen), sf, ensure_ascii=False, indent=2)
-                                except Exception as e:
-                                    logging.debug("Could not update seen_urls.json: %s", e)
-                                # run duplicate handler on new file
-                                try:
-                                    self._handle_new_file(folder, fn)
-                                except Exception as e:
-                                    logging.debug("Error in dup handler for %s: %s", fn, e)
-                                self.status_signal.emit(f"P: saved {fn}")
-
-                finally:
-                    # если мы создали временный драйвер, то закрываем
-                    if tmp_created and driver_instance:
-                        try:
-                            driver_instance.quit()
-                        except Exception:
-                            pass
-
-
-
-
-            
-            
-            try:
-                if (self.config.get("use_yolo") and self.yolo) or self.config.get("only_bw") or self.config.get("min_size"):
-                    crop_enabled = self.config.get("yolo_crop", False)
-                    crop_folder = None
-                    if crop_enabled:
-                        crop_folder = os.path.join(folder, "_crops")
-                        ensure_folder(crop_folder)
-                    files = list(os.listdir(folder))
-                    for fn in files:
-                        if self._stop:
-                            break
-                        fpath = os.path.join(folder, fn)
-                        if not is_image_file(fpath):
-                            continue
-                        # basic size filter
-                        try:
-                            img = Image.open(fpath)
-                        except (UnidentifiedImageError, OSError, ValueError) as e:
-                            try:
-                                os.remove(fpath)
-                            except Exception:
-                                pass
-                            continue
-                        img_w, img_h = img.size
-                        min_w, min_h = self.config.get("min_size", (100, 100))
-                        if img_w < min_w or img_h < min_h:
-                            try:
-                                os.remove(fpath)
-                            except Exception:
-                                pass
-                            continue
-
-                        # YOLO person detection (if enabled)
-                        boxes = []
-                        if self.config.get("use_yolo") and self.yolo:
-                            try:
-                                boxes = self.yolo.get_person_boxes(fpath)
-                            except Exception as e:
-                                logging.debug("YOLO per-image error: %s", e)
-                                boxes = []
-                            # if enabled, require at least one person detected
-                            if not boxes:
-                                try:
-                                    os.remove(fpath)
-                                except Exception:
-                                    pass
-                                continue
-
-                        # full-body check (if requested)
-                        if self.config.get("full_body_only") and boxes:
-                            keep = False
-                            ratio_thresh = float(self.config.get("full_body_ratio", 0.8))
-                            for box in boxes:
-                                if self._is_full_body_box(box, img_w, img_h, ratio_thresh=ratio_thresh):
-                                    keep = True
-                                    break
-                            if not keep:
-                                try:
-                                    os.remove(fpath)
-                                except Exception:
-                                    pass
-                                continue
-
-                        # black-and-white check
-                        if self.config.get("only_bw"):
-                            try:
-                                if not is_grayscale_image(img):
-                                    try:
-                                        os.remove(fpath)
-                                    except Exception:
-                                        pass
-                                    continue
-                            except Exception as e:
-                                logging.debug("BW check error: %s", e)
-                                continue
-
-                        # save crops if YOLO found boxes and crop enabled
-                        if boxes and crop_enabled:
-                            try:
-                                for i, (x1, y1, x2, y2) in enumerate(boxes):
-                                    crop = img.crop((x1, y1, x2, y2))
-                                    crop_name = f"{Path(fn).stem}_crop{i}.jpg"
-                                    crop.save(os.path.join(crop_folder, crop_name))
-                                    logging.info("YOLO: saved crop %s", crop_name)
-                            except Exception as e:
-                                logging.debug("YOLO crop error: %s", e)
-            except Exception as e:
-                logging.debug("Postprocess top-level error: %s", e)
-
-            # append per-folder seen URLs and finish task
-            try:
-                append_seen_urls(folder, seen)
-            except Exception as e:
-                logging.debug("append_seen_urls error: %s", e)
-
+                th = PinterestScraperThread(query, self._jobs_q, t.get("folder"), self.seen_root, task_meta=task_meta, downloader_meta=downloader_meta, stop_event=stop_ev, logger=LOG, headless=self.cfg.get("pinterest_headless", True))
+            else:
+                continue
+            self._scrapers.append((th, stop_ev))
+            th.start()
+            # wait for scraper to complete
+            while th.is_alive():
+                if self._stop.is_set():
+                    stop_ev.set()
+                time.sleep(0.3)
             done += 1
             try:
-                self.progress_signal.emit(int(done / float(total) * 100))
+                pct = int((done / max(1, total)) * 100)
+                self.progress_signal.emit(pct)
             except Exception:
-                self.progress_signal.emit(0)
+                pass
 
-        self.done_signal.emit()
+    def stop(self):
+        self._stop.set()
+        for th, ev in getattr(self, "_scrapers", []):
+            try:
+                ev.set()
+            except Exception:
+                pass
 
-# GUI -------------------------------------------------------------------------
+# ---------------------------
+# Utilities used by UI
+# ---------------------------
+def is_image_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    return ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
+def compute_image_phash(path):
+    try:
+        from PIL import Image
+        import imagehash
+        return str(imagehash.phash(Image.open(path)))
+    except Exception:
+        LOG.debug("compute_image_phash failed for %s", path, exc_info=True)
+        return None
+
+def save_image_hash_index(folder, index_map):
+    try:
+        p = Path(folder) / "image_hash_index.json"
+        p.write_text(json.dumps(index_map, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        LOG.debug("save_image_hash_index failed", exc_info=True)
+
+# ---------------------------
+# QtLogHandler for Debug tab
+# ---------------------------
+from PyQt5.QtCore import pyqtSignal, QObject
+class QtLogHandler(logging.Handler, QObject):
+    log_signal = pyqtSignal(str)
+    def __init__(self):
+        logging.Handler.__init__(self)
+        QObject.__init__(self)
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.log_signal.emit(msg)
+        except Exception:
+            pass
+
+# QDoubleSpinBoxWithDefaults
 class QDoubleSpinBoxWithDefaults(QDoubleSpinBox):
     def __init__(self, default=0.45):
         super().__init__()
-        self.setRange(0.05, 0.95)
-        self.setSingleStep(0.05)
+        self.setRange(0.0, 1.0)
+        self.setSingleStep(0.01)
         self.setValue(default)
 
+# Detect ultralytics presence for the UI
+HAS_YOLO = False
+try:
+    import importlib
+    HAS_YOLO = importlib.util.find_spec("ultralytics") is not None
+except Exception:
+    HAS_YOLO = False
+
+# ---------------------------
+# MainWindow (restored original UI + fixes)
+# ---------------------------
 class MainWindow(QMainWindow):
 
     def start_pinterest_browser(self, silent=True):
-        # запускается в GUI потоке — создаем браузер и сохраняем + lock
         if getattr(self, 'pinterest_driver', None):
             logging.info("Pinterest driver already running.")
             if not silent:
                 QMessageBox.information(self, 'Browser', 'Browser is running.')
-            # ensure buttons state
             try:
                 self.pinterest_start_btn.setEnabled(False)
                 self.pinterest_stop_btn.setEnabled(True)
@@ -1166,41 +1126,64 @@ class MainWindow(QMainWindow):
             from selenium.webdriver.chrome.service import Service
             from selenium.webdriver.chrome.options import Options
             from webdriver_manager.chrome import ChromeDriverManager
+
             opts = Options()
+
+            # Headless
             if self.settings.get('pinterest_headless', True):
                 try:
                     opts.add_argument('--headless=new')
                 except Exception:
                     opts.add_argument('--headless')
+
+            # Маленькое окно для ускорения рендера
+            opts.add_argument('--window-size=800,600')
+
+            # Отключение картинок для ускорения
+            prefs = {
+                "profile.managed_default_content_settings.images": 2
+            }
+            opts.add_experimental_option("prefs", prefs)
+
+            # Прочие оптимизации
             opts.add_argument('--no-sandbox')
             opts.add_argument('--disable-dev-shm-usage')
             opts.add_argument('--log-level=3')
-            # use local cache for driver to avoid repeated downloads
+            opts.add_argument('--disable-gpu')
+
             driver_path = ChromeDriverManager().install()
             service = Service(driver_path)
+
             self.pinterest_driver = webdriver.Chrome(service=service, options=opts)
             self.pinterest_driver_lock = threading.Lock()
             logging.info('Started Pinterest driver at %s', driver_path)
-            # update UI buttons
+
             try:
                 self.pinterest_start_btn.setEnabled(False)
                 self.pinterest_stop_btn.setEnabled(True)
             except Exception:
                 pass
+
             if not silent:
                 QMessageBox.information(self, 'Browser', 'Pinterest browser is running.')
+
+            try:
+                BROWSER_HELPER.add_driver(self.pinterest_driver)
+                if getattr(service, "process", None) and hasattr(service.process, "pid"):
+                    BROWSER_HELPER.add_pid(service.process.pid)
+            except Exception:
+                pass
+
         except Exception as e:
             logging.error('Failed to start Pinterest browser: %s', e)
             if not silent:
                 QMessageBox.critical(self, 'Error', f'Failed to start browser: {e}')
-
 
     def stop_pinterest_browser(self):
         d = getattr(self, "pinterest_driver", None)
         if not d:
             logging.info("Pinterest driver not running (stop invoked).")
             QMessageBox.information(self, "Browser", "The browser is not running.")
-            # ensure buttons reflect stopped state
             try:
                 self.pinterest_start_btn.setEnabled(True)
                 self.pinterest_stop_btn.setEnabled(False)
@@ -1221,25 +1204,23 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         QMessageBox.information(self, "Browser", "The browser is stopped.")
+        try:
+            BROWSER_HELPER.cleanup()
+        except Exception:
+            pass
 
+    def __init__(self):                                                                                                                      #####GUI 
 
-    def __init__(self):
         super().__init__()
         self.setWindowTitle("Reference Scraper by Hara (modified and wrote by ChatGPT) for personal use")
         self.setGeometry(120, 120, 980, 760)
-        
-        # load settings from disk if available
-        self.settings = DEFAULT_SETTINGS.copy()
 
-        # --- Live log view для вкладки "Отладка" ---
+        self.settings = DEFAULT_SETTINGS.copy()
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
 
-        # Создаём и подключаем QtLogHandler (не дублируем, если уже добавлен)
         self._qt_log_handler = QtLogHandler()
         self._qt_log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-
-        # Добавляем handler к корневому логгеру только один раз
         root_logger = logging.getLogger()
         already = False
         for h in getattr(root_logger, "handlers", []):
@@ -1247,27 +1228,20 @@ class MainWindow(QMainWindow):
                 already = True
                 break
         if not already:
-            # подключаем сигнал к методу _append_log (метод добавим ниже)
-            self._qt_log_handler.log_signal.connect(self._append_log)
+            try:
+                self._qt_log_handler.log_signal.connect(self._append_log)
+            except Exception:
+                pass
             root_logger.addHandler(self._qt_log_handler)
-        # --- /Live log view ---
 
         self._load_settings_from_disk()
         ensure_folder(self.settings["save_folder"])
         self.threads = []
         self.scraper_thread = None
         self._init_ui()
-        # start pinterest driver automatically if pinterest enabled
-        try:
-            if self.settings.get("use_pinterest", True):
-                self.start_pinterest_browser(silent=True)
-        except Exception as e:
-            logging.debug("Auto-start Pinterest driver failed: %s", e)
-    
+
     def _append_log(self, msg: str):
-        """Добавляет строку в виджет логов (вызов из сигнала Qt)."""
         try:
-            # append + автоскролл
             self.log_view.append(msg)
             cursor = self.log_view.textCursor()
             cursor.movePosition(cursor.End)
@@ -1295,40 +1269,81 @@ class MainWindow(QMainWindow):
             logging.debug("Failed to save settings: %s", e)
 
     def _init_ui(self):
+        from PyQt5.QtWidgets import (
+            QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QSplitter, QGroupBox,
+            QLabel, QPushButton, QProgressBar, QAction, QPlainTextEdit
+        )
+        from PyQt5.QtCore import Qt
+
         central = QWidget()
         self.setCentralWidget(central)
-        v = QVBoxLayout()
-        central.setLayout(v)
+        main_layout = QVBoxLayout()
+        central.setLayout(main_layout)
 
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # ===== Левая панель: вкладки настроек =====
         tabs = QTabWidget()
         tabs.addTab(self._tab_sources(), "Sources")
         tabs.addTab(self._tab_poses(), "Poses")
-        tabs.addTab(self._tab_custom_queries(), "Additional requests")  # new tab
+        tabs.addTab(self._tab_custom_queries(), "Additional requests")
         tabs.addTab(self._tab_filters(), "Filters")
-        tabs.addTab(self._tab_debug(), "Debug")
-        v.addWidget(tabs)
+        splitter.addWidget(tabs)
 
-        bottom = QHBoxLayout()
+        # ===== Правая панель: управление + логи =====
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        right_panel.setLayout(right_layout)
+
+        # --- Группа управления ---
+        control_group = QGroupBox("Scraping Control")
+        cg_layout = QVBoxLayout()
+
         self.folder_label = QLabel(f"Save: {self.settings['save_folder']}")
-        bottom.addWidget(self.folder_label)
+        cg_layout.addWidget(self.folder_label)
+
         btn_choose = QPushButton("Choose folder")
         btn_choose.clicked.connect(self.choose_folder)
-        bottom.addWidget(btn_choose)
+        cg_layout.addWidget(btn_choose)
+
         self.btn_start = QPushButton("Start")
         self.btn_start.clicked.connect(self.start_scraping)
-        bottom.addWidget(self.btn_start)
+        cg_layout.addWidget(self.btn_start)
+
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.clicked.connect(self.stop_scraping)
         self.btn_stop.setEnabled(False)
-        bottom.addWidget(self.btn_stop)
-        v.addLayout(bottom)
+        cg_layout.addWidget(self.btn_stop)
 
         self.status_label = QLabel("Ready.")
-        v.addWidget(self.status_label)
-        self.progress_bar = QProgressBar()
-        v.addWidget(self.progress_bar)
+        cg_layout.addWidget(self.status_label)
 
-        # menu
+        self.progress_bar = QProgressBar()
+        cg_layout.addWidget(self.progress_bar)
+
+        control_group.setLayout(cg_layout)
+        right_layout.addWidget(control_group)
+
+        # --- Группа логов ---
+        log_group = QGroupBox("Logs")
+        lg_layout = QVBoxLayout()
+
+        # Используем QPlainTextEdit вместо QTextEdit (быстрее для больших логов)
+        if not hasattr(self, "log_view") or self.log_view is None:
+            from PyQt5.QtGui import QFont
+            self.log_view = QPlainTextEdit()
+            self.log_view.setReadOnly(True)
+            self.log_view.setFont(QFont("Consolas", 9))
+        lg_layout.addWidget(self.log_view)
+
+        log_group.setLayout(lg_layout)
+        right_layout.addWidget(log_group)
+
+        splitter.addWidget(right_panel)
+        splitter.setSizes([650, 300])  # стартовое соотношение панелей
+
+        # ===== Меню =====
         menubar = self.menuBar()
         tools = menubar.addMenu("Tools")
         act_clean = QAction("Clean duplicates", self)
@@ -1337,27 +1352,52 @@ class MainWindow(QMainWindow):
         act_reset_seen = QAction("Reset seen_urls (for all folders)", self)
         act_reset_seen.triggered.connect(self.reset_seen_history)
         tools.addAction(act_reset_seen)
-        # save settings action
         act_save = QAction("Save configuration", self)
         act_save.triggered.connect(lambda: self._save_settings_and_notify())
         tools.addAction(act_save)
-        #INFO      
         act_help = QAction("Info", self)
         act_help.triggered.connect(self.show_help_dialog)
         tools.addAction(act_help)
-        
 
-    def _tab_debug(self):
-        w = QWidget()
-        v = QVBoxLayout()
-        w.setLayout(v)
-        v.addWidget(QLabel("Parser logs:"))
-        # если по какой-то причине self.log_view ещё не создан — создаём локально и присваиваем
-        if not hasattr(self, "log_view") or self.log_view is None:
-            self.log_view = QTextEdit()
-            self.log_view.setReadOnly(True)
-        v.addWidget(self.log_view)
-        return w
+        # ===== Стиль =====
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f5f5f5;
+                font-family: Segoe UI, sans-serif;
+                font-size: 10pt;
+            }
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 6px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QLineEdit, QTextEdit, QPlainTextEdit {
+                background-color: white;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #ccc;
+                background: white;
+            }
+            QGroupBox {
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                margin-top: 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 7px;
+                padding: 0 3px 0 3px;
+            }
+        """)
+
 
     def _tab_sources(self):
         w = QWidget()
@@ -1385,14 +1425,13 @@ class MainWindow(QMainWindow):
 
     def _tab_poses(self):
         w = QWidget(); v = QVBoxLayout(); w.setLayout(v)
-        # genders
         gb = QGroupBox("Gender"); hl = QHBoxLayout()
         self.gender_checks = {}
-        saved_genders = set(self.settings.get("genders", ["man","woman","boy","girl"])) 
+        saved_genders = set(self.settings.get("genders", ["man","woman","boy","girl"]))
         for g in ["man","woman","boy","girl"]:
             cb = QCheckBox(g); cb.setChecked(g in saved_genders); self.gender_checks[g] = cb; hl.addWidget(cb)
         gb.setLayout(hl); v.addWidget(gb)
-        # poses
+
         pbox = QGroupBox("Poses"); pl = QGridLayout()
         self.pose_checks = {}
         saved_poses = set(self.settings.get("poses", POSE_TERMS[:6]))
@@ -1401,7 +1440,7 @@ class MainWindow(QMainWindow):
             cb = QCheckBox(term); cb.setChecked(term in saved_poses); self.pose_checks[term] = cb
             pl.addWidget(cb, idx // cols, idx % cols)
         pbox.setLayout(pl); v.addWidget(pbox)
-        # presets and random options
+
         ph = QHBoxLayout()
         self.preset_combo = QComboBox(); self.preset_combo.addItems(["— not selected —", "Foreshortening pack", "Dynamic action pack", "Perspective pack"])
         ph.addWidget(self.preset_combo)
@@ -1424,7 +1463,6 @@ class MainWindow(QMainWindow):
         self.append_custom_cb = QCheckBox("Add additional queries to generated ones"); self.append_custom_cb.setChecked(bool(self.settings.get("append_custom", False)))
         h.addWidget(self.append_custom_cb)
         v.addLayout(h)
-        # domain include/exclude basic
         v.addWidget(QLabel("Include domains (comma separated, optional) — will be saved in Pinterest task/manual scraping"))
         self.include_domains_le = QLineEdit(self.settings.get("include_domains", "")); v.addWidget(self.include_domains_le)
         v.addWidget(QLabel("Exclude domains (comma separated, optional)"))
@@ -1433,26 +1471,20 @@ class MainWindow(QMainWindow):
 
     def _tab_filters(self):
         w = QWidget(); v = QVBoxLayout(); w.setLayout(v)
-
-        # --- Pinterest settings ---
         self.pinterest_fullres_cb = QCheckBox("Download full-res images (if available)")
         self.pinterest_fullres_cb.setChecked(bool(self.settings.get("pinterest_full_res", False)))
         v.addWidget(self.pinterest_fullres_cb)
-        
-        # Кнопки управления браузером
+
         hbr = QHBoxLayout()
         self.pinterest_start_btn = QPushButton("Start browser")
         self.pinterest_start_btn.clicked.connect(self.start_pinterest_browser)
         hbr.addWidget(self.pinterest_start_btn)
-
         self.pinterest_stop_btn = QPushButton("Stop browser")
         self.pinterest_stop_btn.setEnabled(False)
         self.pinterest_stop_btn.clicked.connect(self.stop_pinterest_browser)
         hbr.addWidget(self.pinterest_stop_btn)
         v.addLayout(hbr)
-        # --- End Pinterest settings ---
 
-        # --- Duplicate detection settings ---
         self.dup_cb = QCheckBox("Find duplicates by image (pHash)")
         self.dup_cb.setChecked(bool(self.settings.get("dup_detection", False)))
         v.addWidget(self.dup_cb)
@@ -1464,19 +1496,15 @@ class MainWindow(QMainWindow):
         self.dup_threshold.setValue(float(self.settings.get("dup_threshold", 0.8)))
         hdup.addWidget(QLabel("Threshold of similarity (0..1):"))
         hdup.addWidget(self.dup_threshold)
-
         self.dup_action_combo = QComboBox()
         self.dup_action_combo.addItems(["delete_new", "replace_existing", "keep_both"])
         self.dup_action_combo.setCurrentText(self.settings.get("dup_action", "delete_new"))
         hdup.addWidget(self.dup_action_combo)
         v.addLayout(hdup)
-        # Button to reindex folder hashes
+
         self.reindex_btn = QPushButton("Index folder (hashes)")
         self.reindex_btn.clicked.connect(self.reindex_folder_dialog)
         v.addWidget(self.reindex_btn)
-
-        # --- End Duplicate detection settings ---
-
 
         self.yolo_cb = QCheckBox("People filter (YOLOv8)")
         if not HAS_YOLO:
@@ -1528,11 +1556,9 @@ class MainWindow(QMainWindow):
         if f:
             self.settings["save_folder"] = f
             self.folder_label.setText(f"Save: {f}")
-            # persist immediately
             self._save_settings_from_ui()
 
     def _gather_ui_settings(self):
-        # gather persistent settings from UI into self.settings dict
         self.settings["save_folder"] = self.settings.get("save_folder", DEFAULT_SAVE_FOLDER)
         self.settings["count_per_category"] = int(self.count_spin.value())
         self.settings["pages_per_task"] = int(self.pages_spin.value())
@@ -1559,14 +1585,12 @@ class MainWindow(QMainWindow):
         poses = [p for p,cb in self.pose_checks.items() if cb.isChecked()]
         self.settings["genders"] = genders
         self.settings["poses"] = poses
-        
+
         self.settings["pinterest_full_res"] = bool(self.pinterest_fullres_cb.isChecked())
         self.settings["dup_detection"] = bool(self.dup_cb.isChecked())
         self.settings["dup_threshold"] = float(self.dup_threshold.value())
         self.settings["dup_action"] = str(self.dup_action_combo.currentText())
 
-
-        # custom queries and domain filters
         self.settings["custom_queries"] = str(self.custom_queries_edit.toPlainText() or "")
         self.settings["use_custom_only"] = bool(self.use_custom_only_cb.isChecked())
         self.settings["append_custom"] = bool(self.append_custom_cb.isChecked())
@@ -1575,29 +1599,20 @@ class MainWindow(QMainWindow):
 
     def _save_settings_from_ui(self):
         self._gather_ui_settings()
-        # also persist to disk
         self._save_settings_to_disk()
-
-
+                                                                                                                            ###########GUI
     def collect_config_and_tasks(self):
-        # first update settings from UI
         self._gather_ui_settings()
-
         cfg = {}
-        cfg.update(self.settings)  # copy everything
+        cfg.update(self.settings)
         sources = []
         if self.settings.get("use_google", True): sources.append("google")
         if self.settings.get("use_bing", False): sources.append("bing")
         if self.settings.get("use_pinterest", True): sources.append("pinterest")
         cfg["sources"] = sources
-
         tasks = []
-
-        # handle custom queries (one per line)
         custom_raw = self.settings.get("custom_queries", "").strip()
         custom_list = [line.strip() for line in custom_raw.splitlines() if line.strip()]
-
-        # if custom-only, create tasks from custom queries only
         if self.settings.get("use_custom_only") and custom_list:
             for q in custom_list:
                 for src in sources:
@@ -1613,13 +1628,10 @@ class MainWindow(QMainWindow):
                         "include_domains": cfg.get("include_domains", ""),
                         "exclude_domains": cfg.get("exclude_domains", "")
                     })
-
         else:
-            # generate queries from genders/poses
             genders = self.settings.get("genders", [])
             poses = self.settings.get("poses", [])
             if not sources or not genders or not poses:
-                # allow fallback to custom queries even if not full config
                 if custom_list and sources:
                     for q in custom_list:
                         for src in sources:
@@ -1636,11 +1648,8 @@ class MainWindow(QMainWindow):
                                 "exclude_domains": cfg.get("exclude_domains", "")
                             })
                 else:
-                    # nothing to do
                     cfg["tasks"] = []
                     return cfg
-
-            # otherwise build generated queries (with auto-append of custom queries)
             n_queries = 2 if not cfg.get("strong_random") else 4
             for gender in genders:
                 for pose in poses:
@@ -1659,7 +1668,6 @@ class MainWindow(QMainWindow):
                                 "include_domains": cfg.get("include_domains", ""),
                                 "exclude_domains": cfg.get("exclude_domains", "")
                             })
-                            # if custom list provided, also create queries that append custom terms to this generated query
                             if custom_list:
                                 for custom_term in custom_list:
                                     q2 = q + " " + custom_term
@@ -1675,7 +1683,6 @@ class MainWindow(QMainWindow):
                                         "include_domains": cfg.get("include_domains", ""),
                                         "exclude_domains": cfg.get("exclude_domains", "")
                                     })
-
         cfg["tasks"] = tasks
         return cfg
 
@@ -1684,24 +1691,17 @@ class MainWindow(QMainWindow):
         if not cfg.get("tasks"):
             QMessageBox.warning(self, "Error", "No tasks created (check sources, gender/poses or additional queries)." )
             return
-
-        # persist some settings and save to disk
         self._save_settings_from_ui()
-
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("Running...")
-
         thread_cfg = cfg.copy()
-        # pass the pre-initialized Pinterest driver to the worker thread (if available)
         if getattr(self, "pinterest_driver", None):
             thread_cfg["pinterest_driver"] = self.pinterest_driver
             thread_cfg["pinterest_driver_lock"] = self.pinterest_driver_lock
-
-        
-
         thread_cfg.update(self.settings)
+        ensure_folder(thread_cfg.get("save_folder", DEFAULT_SAVE_FOLDER))
         self.scraper_thread = ScraperThread(thread_cfg)
         self.scraper_thread.status_signal.connect(self.status_label.setText)
         try:
@@ -1715,16 +1715,14 @@ class MainWindow(QMainWindow):
     def stop_scraping(self):
         if self.scraper_thread:
             self.scraper_thread.stop()
-            self.status_label.setText("Waiting for scaping to stop...")
+            self.status_label.setText("Waiting for scraping to stop...")
 
     def on_done(self):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.status_label.setText("Completed.")
         QMessageBox.information(self, "Done", "Parsing complete.")
-        # save settings when finished
         self._save_settings_from_ui()
-        # cleanup thread registry
         try:
             if self.scraper_thread in getattr(self, 'threads', []):
                 try:
@@ -1751,22 +1749,105 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to clean up: {e}")
 
     def _remove_duplicates(self, folder, min_size=(200,200)):
+        """
+        Robust duplicate remover based on imagehash.phash.
+        Returns (removed_count, kept_map) where kept_map maps kept filenames -> phash.
+        Uses self.settings.get("dup_threshold", 0.8) as similarity fraction.
+        """
         removed = 0
         kept = {}
-        for fn in list(os.listdir(folder)):
+        try:
+            from PIL import Image, UnidentifiedImageError
+            import imagehash
+        except Exception:
+            LOG.exception("Pillow or imagehash missing")
+            return removed, kept
+
+        # collect phashes for all images that pass min_size
+        phashes = {}
+        for fn in sorted(os.listdir(folder)):
             fp = os.path.join(folder, fn)
             if not is_image_file(fp):
                 continue
             try:
                 img = Image.open(fp)
                 if img.size[0] < min_size[0] or img.size[1] < min_size[1]:
-                    os.remove(fp); removed += 1
-            except (UnidentifiedImageError, OSError, ValueError):
+                    continue
+                h = str(imagehash.phash(img))
+                if h:
+                    phashes[fn] = h
+            except UnidentifiedImageError:
+                continue
+            except Exception:
+                LOG.debug("Hashing failed for %s", fp, exc_info=True)
+                continue
+
+        if not phashes:
+            return removed, kept
+
+        # determine bit length (phash hex length * 4)
+        example_hex = next(iter(phashes.values()))
+        bits = len(example_hex) * 4
+        # threshold from settings: fraction of similarity (0..1). Convert to max hamming distance.
+        sim = float(self.settings.get("dup_threshold", 0.8)) if hasattr(self, "settings") else 0.8
+        sim = max(0.0, min(1.0, sim))
+        max_dist = int((1.0 - sim) * bits)
+
+        names = list(phashes.keys())
+        removed_set = set()
+        # compare every pair (O(n^2), ok for folder-level clean)
+        for i, a in enumerate(names):
+            if a in removed_set:
+                continue
+            ha = imagehash.hex_to_hash(phashes[a])
+            for b in names[i+1:]:
+                if b in removed_set:
+                    continue
+                hb = imagehash.hex_to_hash(phashes[b])
                 try:
-                    os.remove(fp); removed += 1
+                    dist = ha - hb
                 except Exception:
-                    pass
+                    # fallback simple hex compare
+                    dist = sum(c1 != c2 for c1, c2 in zip(phashes[a], phashes[b]))
+                if dist <= max_dist:
+                    # decide which to keep: prefer larger filesize, then older mtime
+                    a_path = os.path.join(folder, a)
+                    b_path = os.path.join(folder, b)
+                    try:
+                        a_sz = os.path.getsize(a_path)
+                        b_sz = os.path.getsize(b_path)
+                    except Exception:
+                        a_sz = b_sz = 0
+                    if a_sz >= b_sz:
+                        try:
+                            os.remove(b_path)
+                            removed += 1
+                            removed_set.add(b)
+                        except Exception:
+                            LOG.debug("Failed remove %s", b_path, exc_info=True)
+                    else:
+                        try:
+                            os.remove(a_path)
+                            removed += 1
+                            removed_set.add(a)
+                            break  # a removed, stop comparing a with others
+                        except Exception:
+                            LOG.debug("Failed remove %s", a_path, exc_info=True)
+                            # if cannot remove 'a', attempt to remove b instead
+                            try:
+                                os.remove(b_path)
+                                removed += 1
+                                removed_set.add(b)
+                            except Exception:
+                                pass
+
+        # build kept map (phashes left on disk)
+        for fn, h in phashes.items():
+            if fn not in removed_set and os.path.exists(os.path.join(folder, fn)):
+                kept[fn] = h
+
         return removed, kept
+
 
     def reset_seen_history(self):
         base = self.settings.get("save_folder")
@@ -1784,12 +1865,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Reseted", f"Deleted {removed} seen_urls.json files.")
 
     def reindex_folder_dialog(self):
-        # Выбор папки для индексирования
         folder = QFileDialog.getExistingDirectory(self, "Select a folder to index")
         if not folder:
             return
-
-        # Индексация изображений
         count = 0
         idx = {}
         try:
@@ -1808,8 +1886,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to index folder: {e}")
             return
-
-        # Удаление всех seen_urls.json в выбранной папке и подпапках
         removed = 0
         for root, dirs, files in os.walk(folder):
             if "seen_urls.json" in files:
@@ -1818,164 +1894,155 @@ class MainWindow(QMainWindow):
                     removed += 1
                 except Exception:
                     pass
-
         QMessageBox.information(self, "Reseted", f"Deleted {removed} seen_urls.json files.")
 
     def _save_settings_and_notify(self):
         self._save_settings_from_ui()
         QMessageBox.information(self, "Saved", f"Configure saved in {CONFIG_PATH}")
 
-        def closeEvent(self, event):
-            try:
-                # First, attempt to stop background QThreads gracefully
+    def closeEvent(self, event):
+        try:
+            # Stop threads started by UI
+            for t in list(getattr(self, 'threads', []) or []):
                 try:
-                    for t in list(getattr(self, 'threads', []) or []):
+                    if hasattr(t, 'stop'):
+                        t.stop()
+                    if isinstance(t, QThread):
                         try:
-                            if hasattr(t, 'stop'):
-                                t.stop()
-                            # wait briefly for thread to finish
-                            try:
-                                t.wait(3000)
-                            except Exception:
-                                pass
-                            if t.isRunning():
-                                try:
-                                    t.terminate()
-                                except Exception:
-                                    pass
-                                try:
-                                    t.wait()
-                                except Exception:
-                                    pass
+                            t.wait(3000)
                         except Exception:
                             pass
                 except Exception:
                     pass
-        
-                # Закрыть Selenium WebDriver (GUI-owned)
-                if hasattr(self, 'pinterest_driver') and self.pinterest_driver:
-                    try:
-                        self.pinterest_driver.quit()
-                    except Exception:
+
+            # specifically stop scraper thread if running
+            if getattr(self, 'scraper_thread', None):
+                try:
+                    self.scraper_thread.stop()
+                    if isinstance(self.scraper_thread, QThread):
                         try:
-                            self.pinterest_driver.close()
+                            self.scraper_thread.wait(3000)
                         except Exception:
                             pass
-        
-                    # give a bit of time for subprocesses to terminate
-                    try:
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-        
-                    self.pinterest_driver = None
-                    self.pinterest_driver_lock = None
-        
-                # Остановить все таймеры
-                for timer in getattr(self, 'timers', []):
-                    try:
-                        timer.stop()
-                    except Exception:
-                        pass
-        
-            except Exception as e:
-                print('Error while closing: gonna try to force terminating the entire process', e)
-        
-            event.accept()
-        
-            # Принудительное завершение всего процесса (последний шанс)
+                except Exception:
+                    pass
+
+            # if scraper exposed downloader threads, ensure they are stopped and flushed
             try:
-                import sys, os
-                os._exit(0)
+                if getattr(self, 'scraper_thread', None) and getattr(self.scraper_thread, "_downloaders", None):
+                    for d in self.scraper_thread._downloaders:
+                        try:
+                            d.stop(wait=True)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
+            if hasattr(self, 'pinterest_driver') and self.pinterest_driver:
+                try:
+                    self.pinterest_driver.quit()
+                except Exception:
+                    try:
+                        self.pinterest_driver.close()
+                    except Exception:
+                        pass
+                self.pinterest_driver = None
+                self.pinterest_driver_lock = None
+
+            for timer in getattr(self, 'timers', []):
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+            try:
+                BROWSER_HELPER.cleanup()
+            except Exception:
+                pass
+
+        except Exception as e:
+            LOG.exception("Error while closing: forcing process termination: %s", e)
+
+        # Let Qt close the window normally so background threads can finish and flush their state.
+        event.accept()
+        '''
+        try:
+            os._exit(0)
+        except Exception:
+            pass
+        '''
+
     def show_help_dialog(self):
-            help_text = """
+    
+        help_text = """
+        Версия: 2.0.1
+
+        /// 
+        
+        Основные изменения и улучшения:
+
+         - GUI и UX - новый двухпанельный интерфейс, менее загромождённый основной экран
+         - Параллельная загрузка - Запуск нескольких DownloaderThread по настройке downloader_threads
+         - Надёжная обработка дубликатов (pHash) - порог сходства переводится в максимальную Hamming-distance, логика сравнения стабильна для пустых/старых индексов
+         - Исправлен и унифицирован seen (history) - seen_urls, seen_files, seen_hashes сохраняются в папке .seen и финальная запись .seen исполняется корректно
+         - Корректный replace_existing - надёжное разрешение существующего пути, при замене удаляется реальный файл, индекс обновляется
+         - Улучшения парсинга и взаимодействия с Pinterest - оптимизирован запуск Chrome, съедает меньше трафика и быстрее подгружает страницы
+         - Надёжность и graceful shutdown - closeEvent переписан, потоки корректно останавливаются и ждут flush
             
-            RU
-            Версия: 1.0.1
+        ///
+        
+        Описание:
+        Программа предназначена для автоматического парсинга в первую очередь референсов для художников, загрузки и фильтрации их из:
+         - Pinterest (с поддержкой полноразмерных изображений)
+         - Google Images
+         - Bing Images
+        
+        Не требует сторонних API, сбор происходит через Selenium/webdriver-manager.
+        
+        Основные возможности:
+         • Поиск изображений по ключевым словам, категориям, позам и дополнительным запросам
+         • Автоматическая фильтрация:
+            - Проверка наличия человека в кадре (YOLO)
+            - Определение полноразмерных изображений
+            - Фильтрация низкокачественных файлов (<10 KB)
+            - Проверка и удаление дубликатов по содержимому (pHash)
+         • Работа с историей: исключение уже скачанных изображений (seen_urls.json)
+         • Сохранение полноразмерных URL в `full_urls.log`
+         • Возможность индексировать папки для ускоренной проверки дубликатов
+         • Живой лог работы во вкладке «Отладка»
+         • Сохранение настроек программы между запусками
 
-            Описание:
-            Программа предназначена для автоматического парсинга в первую очередь референсов для художников, загрузки и фильтрации их из:
-             - Pinterest (с поддержкой полноразмерных изображений)
-             - Google Images
-             - Bing Images
-            
-            Не требует сторонних API, сбор происходит через Selenium/webdriver-manager.
-            
-            Основные возможности:
-             • Поиск изображений по ключевым словам, категориям, позам и дополнительным запросам
-             • Автоматическая фильтрация:
-                - Проверка наличия человека в кадре (YOLO)
-                - Определение полноразмерных изображений
-                - Фильтрация низкокачественных файлов (<10 KB)
-                - Проверка и удаление дубликатов по содержимому (pHash)
-             • Работа с историей: исключение уже скачанных изображений (seen_urls.json)
-             • Сохранение полноразмерных URL в `full_urls.log`
-             • Возможность индексировать папки для ускоренной проверки дубликатов
-             • Живой лог работы во вкладке «Отладка»
-             • Сохранение настроек программы между запусками
+        Примечания:
+         - Все файлы сохраняются с уникальными именами (дата/время + случайный хвост)
+         - Историю скачанных URL можно сбросить через меню
 
-            Примечания:
-             - Все файлы сохраняются с уникальными именами (дата/время + случайный хвост)
-             - Историю скачанных URL можно сбросить через меню
+        Разработчик логики и тестрировщик: Hara
+        Разработал и написал код: ChatGPT
+        
+        https://t.me/rambaharamba
+        
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Help")
+        layout = QVBoxLayout(dlg)
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(help_text.strip())
+        layout.addWidget(text_edit)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        dlg.resize(650, 950)
+        dlg.exec_()
 
-            Разработчик логики и тестрировщик: Hara
-            Разработал и написал код: ChatGPT
-            
-            EN 
-            Version: 1.0.1
-            
-            Description:
-            The program is designed for automatic parsing primarily references for artists, downloading and filtering them from:
-            - Pinterest (with support for full-size images)
-            - Google Images
-            - Bing Images
-
-            Does not require third-party APIs, collection occurs through Selenium/webdriver-manager.
-
-            Main features:
-            • Search images by keywords, categories, poses and additional queries
-            • Automatic filtering:
-            - Check for a person in the frame (YOLO)
-            - Detection of full-size images
-            - Filtering low-quality files (<10 KB)
-            - Checking and removing duplicates by content (pHash)
-            • Working with history: excluding already downloaded images (seen_urls.json)
-            • Saving full-size URLs in `full_urls.log`
-            • Ability to index folders for faster duplicate checking
-            • Live log of work in the "Debug" tab
-            • Saving program settings between launches
-
-            Notes:
-            - All files are saved with unique names (date/time + random tail)
-            - The history of downloaded URLs can be reset via the menu
-
-            Logic developer and tester: Hara
-            Developed and wrote the code: ChatGPT
-            
-            https://t.me/rambaharamba
-            
-            """
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Help")
-            layout = QVBoxLayout(dlg)
-            text_edit = QTextEdit()
-            text_edit.setReadOnly(True)
-            text_edit.setPlainText(help_text.strip())
-            layout.addWidget(text_edit)
-            btn = QPushButton("Close")
-            btn.clicked.connect(dlg.accept)
-            layout.addWidget(btn)
-            dlg.resize(650, 950)
-            dlg.exec_()
-
-
-# Run -------------------------------------------------------------------------
+# ---------------------------
+# Bootstrap
+# ---------------------------
+def main():
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    wnd = MainWindow()
-    wnd.show()
-    sys.exit(app.exec_())
+    main()
