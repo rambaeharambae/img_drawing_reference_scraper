@@ -34,6 +34,23 @@
             Logic developer and tester: Hara
             Developed and wrote the code: ChatGPT
 
+            Future improvements:
+            - New classes to search (animals and items)
+            - Filter by poses and number of people
+            - Pose estimation (Keypoint detection), checks that the frame contains visible limbs/pose
+            - Automatic model selection: if the task is general, take the standard yolov8n.pt for speed, or yolov8m.pt for quality
+            - Visualization and filter preview - open a window with examples of recognized frames, highlighted boxes and statistics (how many were filtered out, how many were left)
+            - Asynchronous loading + processing
+            - Advanced content analysis (YOLO + Pose Estimation + OCR + scene recognition: selection by facial expression/body position)
+            - Watermark removal, filters by main (dominant) color and composition
+            - Automatic sorting by categories/tags
+            - Built-in ban protection: User-Agent rotation, random delays and random browser emulation
+            - Export results to ZIP/JSON
+            - GUI and UX: gonna be like a Figma/Notion style
+            
+            Logic developer and tester: Hara
+            Developed and wrote the code: ChatGPT
+          
           Dependencies:
             - Python 3.x
             - PyQt5
