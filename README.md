@@ -1,12 +1,12 @@
-🎨 # imgscraper for artists from the artist: parser - collecting references - description, features and dependencies
+ # imgscraper for artists from the artist: parser - collecting references - description, features and dependencies
 
-          Description:
+          🎨 Description:
             The program is designed for automatic parsing primarily references for artists, downloading, sorting and filtering them from:
             - Pinterest (with support for full-size images)
             - Google Images
             - Bing Images
 
-            Does not require third-party APIs, collection occurs through Selenium/webdriver-manager/icrawler locally.
+            💡 Does not require third-party APIs, collection occurs through Selenium/webdriver-manager/icrawler locally.
 
            🚀 Main features:
           • Search images by keywords, categories, poses and additional (separate) requests
@@ -46,9 +46,10 @@
             - Built-in ban protection: User-Agent rotation, random delays and random browser emulation
             - Export results to ZIP/JSON
             - GUI and UX: gonna be like a Figma/Notion style
-            
-            Logic developer and tester: Hara
-            Developed and wrote the code: ChatGPT
+
+            👨‍💻 Authors:
+            - Logic developer and tester: Hara
+            - Development and code: ChatGPT 
           
            📦 Dependencies:
             - Python 3.x
