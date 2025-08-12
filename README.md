@@ -1,4 +1,4 @@
-# imgscraper for artists from the artist: parser - collecting references - description, features and dependencies
+🎨 # imgscraper for artists from the artist: parser - collecting references - description, features and dependencies
 
           Description:
             The program is designed for automatic parsing primarily references for artists, downloading, sorting and filtering them from:
@@ -8,7 +8,7 @@
 
             Does not require third-party APIs, collection occurs through Selenium/webdriver-manager/icrawler locally.
 
-            Main features:
+           🚀 Main features:
           • Search images by keywords, categories, poses and additional (separate) requests
           • Automatic filtering:
           
@@ -30,10 +30,10 @@
           • Selecting the parsing mode for sketches\lines only
           • Full randomization of the search when parsing (helpful when you search for new material through search engines)
 
-            Notes:
+           📝 Notes:
             - The first launch may be long due to the absence of some dependent libraries on the device (like YOLO\WebDriver-manager)
 
-            Future improvements:
+           ⚡ Future improvements:
             - New classes to search (animals and items)
             - Filter by precise poses and number of people
             - Pose estimation (Keypoint detection), checks that the frame contains visible limbs/pose
@@ -50,7 +50,7 @@
             Logic developer and tester: Hara
             Developed and wrote the code: ChatGPT
           
-           Dependencies:
+           📦 Dependencies:
             - Python 3.x
             - PyQt5
             - Selenium
