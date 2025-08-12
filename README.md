@@ -11,11 +11,13 @@
             Main features:
           • Search images by keywords, categories, poses and additional (separate) requests
           • Automatic filtering:
+          
           - Check for a person in the frame (YOLO + you can change the trigger parameter)
           - Detect a full-length person in the image (you can change the trigger parameter)
           - Filter low-quality files (<10 KB)
           - Filter for black and white images (you can combine Poses + Additional requests = "black and white" + Filter black and white)
           - Check and remove duplicates via pHash (you can change the trigger parameter)
+          
           • Work with history: exclude already loaded images (seen_urls.json)
           • Save full-size URLs in `full_urls.log`
           • Load full-res images
@@ -30,9 +32,6 @@
 
             Notes:
             - The first launch may be long due to the absence of some dependent libraries on the device (like YOLO\WebDriver-manager)
-            
-            Logic developer and tester: Hara
-            Developed and wrote the code: ChatGPT
 
             Future improvements:
             - New classes to search (animals and items)
