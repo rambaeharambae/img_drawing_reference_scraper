@@ -50,7 +50,7 @@
             Logic developer and tester: Hara
             Developed and wrote the code: ChatGPT
           
-          Dependencies:
+           Dependencies:
             - Python 3.x
             - PyQt5
             - Selenium
