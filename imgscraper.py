@@ -1,4 +1,3 @@
-# imgscraper.py
 
 from pathlib import Path
 import os
@@ -16,6 +15,11 @@ import random
 import re
 from urllib.parse import quote_plus
 from icrawler.builtin import GoogleImageCrawler, BingImageCrawler
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 
 # PyQt imports
 try:
@@ -134,6 +138,25 @@ def load_seen(folder: str):
             data = json.loads(f.read_text(encoding="utf-8") or "{}")
             if isinstance(data, dict):
                 hashes.update(data)
+
+        def _hex_to_int(h):
+            try:
+                return int(h, 16)
+            except Exception:
+                return None
+
+        # after loading seen_hashes dict (hex->path)
+        int_map = {}
+        buckets = {}
+        prefix_bits = 16
+        for hex_k, v in hashes.items():
+            i = _hex_to_int(hex_k)
+            if i is None:
+                continue
+            int_map[i] = v
+            bucket = i >> (len(hex_k)*4 - prefix_bits)
+            buckets.setdefault(bucket, set()).add(i)
+
     except Exception:
         LOG.debug("load_seen: failed loading seen_hashes", exc_info=True)
     return urls, files, hashes
@@ -167,6 +190,24 @@ def append_seen(folder: str, urls=None, filenames=None, hashes=None):
         f.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         LOG.debug("append_seen: failed write seen_hashes", exc_info=True)
+        
+        def _hex_to_int(h):
+            try:
+                return int(h, 16)
+            except Exception:
+                return None
+
+        # after loading seen_hashes dict (hex->path)
+        int_map = {}
+        buckets = {}
+        prefix_bits = 16
+        for hex_k, v in hashes.items():
+            i = _hex_to_int(hex_k)
+            if i is None:
+                continue
+            int_map[i] = v
+            bucket = i >> (len(hex_k)*4 - prefix_bits)
+            buckets.setdefault(bucket, set()).add(i)
 
 # ---------------------------
 # Browser/process helper
@@ -232,38 +273,143 @@ BROWSER_HELPER = BrowserPidHelper()
 # Basic downloader
 # ---------------------------
 def download_image_basic(url: str, dest_path: str, timeout=20, headers=None):
-    headers = headers or {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36"}
+    headers = headers or {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0 Safari/537.36"
+        )
+    }
     try:
         with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
             r.raise_for_status()
+            ct = r.headers.get("Content-Type", "").lower()
+            if not ct.startswith("image/"):
+                LOG.debug("download_image_basic: skipped non-image content-type %s for %s", ct, url)
+                return False
+
             tmp = dest_path + ".part"
             with open(tmp, "wb") as fh:
                 shutil.copyfileobj(r.raw, fh)
             os.replace(tmp, dest_path)
+
         LOG.info("Downloaded %s", dest_path)
         return True
     except Exception:
         LOG.debug("download_image_basic failed for %s", url, exc_info=True)
         try:
-            if os.path.exists(dest_path + ".part"):
-                os.remove(dest_path + ".part")
+            part_path = dest_path + ".part"
+            if os.path.exists(part_path):
+                os.remove(part_path)
         except Exception:
             pass
         return False
 
+
+# module-level
+YOLO_QUEUE = None
+APPEND_LOCK = threading.Lock()
+
+class YOLOWorker(threading.Thread):
+    def __init__(self, yolo_q, stop_event, model_name="yolov8n.pt", conf=0.45, crop=False, full_body_ratio=0.8):
+        super().__init__(daemon=True)
+        self.q = yolo_q
+        self.stop_event = stop_event
+        self.model_name = model_name
+        self.conf = conf
+        self.crop = crop
+        self.full_body_ratio = full_body_ratio
+        self._filter = None
+
+    def _ensure(self):
+        if self._filter is None:
+            self._filter = YOLOFilter(model_name=self.model_name, conf=self.conf)
+
+    def run(self):
+        self._ensure()
+        while not self.stop_event.is_set():
+            try:
+                job = self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                path = job.get("path")
+                meta = job.get("meta", {})
+                url = job.get("url")
+                # run inference
+                ok_person = self._filter.has_person(path)  # keep YOLOFilter.has_person API
+                if meta.get("full_body_only") and ok_person:
+                    # optional: call a new YOLOFilter method to check bbox height ratio
+                    pass
+                if not ok_person and meta.get("yolo_action", "delete_no_person") == "delete_no_person":
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        LOG.debug("YOLO removed failed %s", path, exc_info=True)
+                    # задача обработана, переходим к следующей
+                    self.q.task_done()
+                    continue
+
+                # compute phash here (off main downloader thread)
+                phash = None
+                if meta.get("compute_hash", False):
+                    try:
+                        from PIL import Image
+                        import imagehash
+                        phash = str(imagehash.phash(Image.open(path)))
+                    except Exception:
+                        LOG.debug("YOLOWorker: phash failed for %s", path, exc_info=True)
+
+                # duplicate detection and update seen index (use APPEND_LOCK to serialize disk writes)
+                if meta.get("dup_detection", False) and phash:
+                    try:
+                        # use append_seen under lock to update persistent index
+                        with APPEND_LOCK:
+                            append_seen(job.get("seen_folder"),
+                                        urls=[url] if url else [],
+                                        filenames=[os.path.basename(path)],
+                                        hashes={phash: path})
+                    except Exception:
+                        LOG.debug("YOLOWorker dup handling error", exc_info=True)
+                else:
+                    with APPEND_LOCK:
+                        append_seen(job.get("seen_folder"),
+                                    urls=[url] if url else [],
+                                    filenames=[os.path.basename(path)],
+                                    hashes={phash: path} if phash else {})
+            except Exception:
+                LOG.exception("YOLOWorker error")
+
+            # task_done вызываем всегда один раз здесь
+            self.q.task_done()
+
+
+
 class DownloaderThread(threading.Thread):
 
-    def __init__(self, jobs_q: queue.Queue, out_folder: str, seen_folder: str, stop_event=None):
+    def __init__(
+        self,
+        jobs_q,
+        out_folder,
+        seen_folder,
+        stop_event=None,
+        yolo_q=None   # <--- новый аргумент
+    ):
         super().__init__(daemon=True)
         self.jobs_q = jobs_q
         self.out_folder = Path(out_folder)
         self.seen_folder = Path(seen_folder)
         self.stop_event = stop_event or threading.Event()
+        self.yolo_q = yolo_q  # <--- сохраняем в атрибут
+        self._flush_interval = 15.0
+        self._last_flush = time.time()
+        self._seen_urls, self._seen_files, self._seen_hashes = load_seen(self.seen_folder)
+
+        # фиксы для batch-хранилищ
         self._batch_urls = set()
         self._batch_files = set()
-        self._batch_hashes = {}
-        self._flush_interval = 2.0
-        self._last_flush = time.time()
+        self._batch_hashes = {}  # было set{}, теперь словарь
 
     def run(self):
         LOG.info("Downloader started")
@@ -351,13 +497,23 @@ class DownloaderThread(threading.Thread):
 
                 # compute perceptual hash if requested (for duplicate detection)
                 phash = None
-                if meta.get("compute_hash", False):
+
+                if self.yolo_q and meta.get("yolo", False):
+                    # передаём работу на YOLOWorker (он сделает phash + обновление seen)
                     try:
-                        from PIL import Image
-                        import imagehash
-                        phash = str(imagehash.phash(Image.open(dest)))
+                        self.yolo_q.put({"path": str(dest), "meta": meta, "url": url, "seen_folder": str(self.seen_folder)})
+                        # don't modify seen here; let worker handle indexing
                     except Exception:
-                        LOG.debug("hash computation failed for %s", dest, exc_info=True)
+                        LOG.debug("Failed to enqueue to YOLO queue for %s", dest, exc_info=True)
+                else:
+
+                    if meta.get("compute_hash", False):
+                        try:
+                            from PIL import Image
+                            import imagehash
+                            phash = str(imagehash.phash(Image.open(dest)))
+                        except Exception:
+                            LOG.debug("hash computation failed for %s", dest, exc_info=True)
 
                 # duplicate handling via pHash if enabled
                 if meta.get("dup_detection", False) and phash:
@@ -458,28 +614,23 @@ class DownloaderThread(threading.Thread):
 
     def _flush_all(self):
         try:
-        
             if not (self._batch_urls or self._batch_files or self._batch_hashes):
                 return
-        
-            if self._batch_urls or self._batch_files or self._batch_hashes:
+
+            with APPEND_LOCK:
                 append_seen(
-                    str(self.seen_folder),
+                    self.seen_folder,
                     urls=self._batch_urls,
                     filenames=self._batch_files,
                     hashes=self._batch_hashes
                 )
-                LOG.debug(
-                    "Flushed seen: %d urls, %d files, %d hashes",
-                    len(self._batch_urls),
-                    len(self._batch_files),
-                    len(self._batch_hashes)
-                )
+
             self._batch_urls.clear()
             self._batch_files.clear()
             self._batch_hashes.clear()
+
         except Exception:
-            LOG.exception("Failed to flush seen")
+            LOG.exception("Error flushing seen data")
 
     def stop(self, wait=True):
         self.stop_event.set()
@@ -522,23 +673,22 @@ class PHashFilter:
         if not hash_str:
             return False
         try:
-            import imagehash
-            for existing in seen_hashes.keys():
-                try:
-                    ha = imagehash.hex_to_hash(existing)
-                    hb = imagehash.hex_to_hash(hash_str)
-                    dist = ha - hb
-                except Exception:
-                    dist = sum(c1 != c2 for c1, c2 in zip(existing, hash_str))
-                if dist <= self.dist_threshold:
-                    return True
-            return False
+            # преобразуем hex строки в int один раз
+            hash_int = int(hash_str, 16)
         except Exception:
-            for existing in seen_hashes.keys():
-                dist = sum(c1 != c2 for c1, c2 in zip(existing, hash_str))
-                if dist <= self.dist_threshold:
-                    return True
             return False
+
+        for existing_hex in seen_hashes.keys():
+            try:
+                existing_int = int(existing_hex, 16)
+            except Exception:
+                continue
+            # быстрый hamming
+            dist = (existing_int ^ hash_int).bit_count()
+            if dist <= self.dist_threshold:
+                return True
+        return False
+
 
 class YOLOFilter:
     def __init__(self, model_name="yolov8n.pt", conf=0.45):
@@ -589,8 +739,9 @@ class YOLOFilter:
 # ---------------------------
 class BaseScraperThread(threading.Thread):
 
-    def __init__(self, query_or_url, jobs_q, out_folder, seen_folder, task_meta=None, downloader_meta=None, stop_event=None, logger=None):
+    def __init__(self, query_or_url, jobs_q, out_folder, seen_folder, seen_cache=None, task_meta=None, downloader_meta=None, stop_event=None, logger=None):
         super().__init__(daemon=True)
+        self.seen_cache = seen_cache
         self.query_or_url = query_or_url
         self.jobs_q = jobs_q
         self.out_folder = out_folder
@@ -599,7 +750,8 @@ class BaseScraperThread(threading.Thread):
         self.downloader_meta = downloader_meta or {}
         self.stop_event = stop_event or threading.Event()
         self.logger = logger or LOG
-
+        self.seen_cache = seen_cache
+        
     def _enqueue(self, url, suggested_name=None):
         fname = suggested_name or os.path.basename(url.split("?")[0]) or f"img_{int(time.time()*1000)}.jpg"
         dest = str(Path(self.out_folder) / fname)
@@ -609,6 +761,8 @@ class BaseScraperThread(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
+
+
 
 class GoogleScraperThread(BaseScraperThread):
     def run(self):
@@ -632,11 +786,30 @@ class GoogleScraperThread(BaseScraperThread):
                 url = task.get('file_url') or task.get('url') or task.get('file_urls')
                 if not url:
                     return
+                
+                def is_image_url(url):
+                    if not url:
+                        return False
+                    url_l = url.lower().split("?")[0]
+                    if any(url_l.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+                        return True
+                    # best-effort HEAD fallback
+                    try:
+                        r = requests.head(url, allow_redirects=True, timeout=5)
+                        ct = r.headers.get("Content-Type", "")
+                        return ct.startswith("image/")
+                    except Exception:
+                        return False
+
+                if not is_image_url(url):
+                    LOG.debug("Skipped non-image URL: %s", url)
+                    return
+
                 # already reached required count
                 if len(found) >= max_results:
                     return
                 # quick seen check from disk (fresh)
-                seen_urls, seen_files, _ = load_seen(str(self.seen_folder))
+                seen_urls, seen_files, _ = self.seen_cache or (set(), set(), {})
                 if (url and url in seen_urls) or (os.path.basename(url).split("?")[0] in seen_files):
                     LOG.debug("Google: skipping seen %s", url)
                     return
@@ -689,13 +862,31 @@ class BingScraperThread(BaseScraperThread):
                 url = task.get('file_url') or task.get('url') or task.get('file_urls')
                 if not url:
                     return
+                
+                def is_image_url(url):
+                    if not url:
+                        return False
+                    url_l = url.lower().split("?")[0]
+                    if any(url_l.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+                        return True
+                    # best-effort HEAD fallback
+                    try:
+                        r = requests.head(url, allow_redirects=True, timeout=5)
+                        ct = r.headers.get("Content-Type", "")
+                        return ct.startswith("image/")
+                    except Exception:
+                        return False
+
+                if not is_image_url(url):
+                    LOG.debug("Skipped non-image URL: %s", url)
+                    return
+
                 # already reached required count
                 if len(found) >= max_results:
                     return
-                # quick seen check from disk (fresh)
-                seen_urls, seen_files, _ = load_seen(str(self.seen_folder))
+                seen_urls, seen_files, _ = self.seen_cache or (set(), set(), {})
                 if (url and url in seen_urls) or (os.path.basename(url).split("?")[0] in seen_files):
-                    LOG.debug("Bing: skipping seen %s", url)
+                    LOG.debug("Google: skipping seen %s", url)
                     return
                 # optional head request size check (<10KB)
                 '''
@@ -730,7 +921,8 @@ class PinterestScraperThread(BaseScraperThread):
         query_or_url,
         jobs_q,
         out_folder,
-        seen_folder,
+        seen_folder=None,
+        seen_cache=None,  # <--- добавили
         task_meta=None,
         downloader_meta=None,
         stop_event=None,
@@ -738,9 +930,17 @@ class PinterestScraperThread(BaseScraperThread):
         headless=True,
         imgs_per_page=10
     ):
-        super().__init__(query_or_url, jobs_q, out_folder, seen_folder,
-                         task_meta=task_meta, downloader_meta=downloader_meta,
-                         stop_event=stop_event, logger=logger)
+        super().__init__(
+            query_or_url,
+            jobs_q,
+            out_folder,
+            seen_folder,
+            seen_cache=seen_cache,  # <--- проброс в базовый класс
+            task_meta=task_meta,
+            downloader_meta=downloader_meta,
+            stop_event=stop_event,
+            logger=logger
+        )
         self.headless = headless
         self.driver = None
         self.imgs_per_page = imgs_per_page
@@ -804,7 +1004,7 @@ class PinterestScraperThread(BaseScraperThread):
                 target = f"https://www.pinterest.com/search/pins/?q={q}"
             self.logger.info("Pinterest: opening %s", target)
             driver.get(target)
-            time.sleep(1.2)
+            WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/pin/']")))
 
             collected = []
             scroll_attempts = 0
@@ -822,7 +1022,7 @@ class PinterestScraperThread(BaseScraperThread):
                         except Exception:
                             continue
                     driver.execute_script("window.scrollBy(0, window.innerHeight);")
-                    time.sleep(0.8)
+                    WebDriverWait(driver, 4).until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "a[href*='/pin/']")) > 0)
                     scroll_attempts += 1
                 except Exception:
                     LOG.debug("Pinterest scroll iteration error", exc_info=True)
@@ -905,12 +1105,13 @@ class ScraperThread(QThread):
     progress_signal = pyqtSignal(int)
     done_signal = pyqtSignal()
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, jobs_q, out_folder, seen_folder, stop_event=None, yolo_q=None):
         super().__init__()
         self.cfg = cfg.copy()
         self._stop = threading.Event()
         self._scrapers = []
         self._jobs_q = queue.Queue()
+        self.yolo_q = yolo_q
 
     def run(self):
         try:
@@ -919,51 +1120,93 @@ class ScraperThread(QThread):
                 self.status_signal.emit("No tasks")
                 self.done_signal.emit()
                 return
+
             self.status_signal.emit("Starting...")
-            # start downloader (single thread pool can be expanded)
-            downloader_threads = int(self.cfg.get("downloader_threads", 10))
-            
+
             save_folder = self.cfg.get("save_folder", DEFAULT_SAVE_FOLDER)
             self.seen_root = str(Path(save_folder) / ".seen")
             ensure_folder(save_folder)
             ensure_folder(self.seen_root)
+            self.seen_urls_global, self.seen_files_global, self.seen_hashes_global = load_seen(self.seen_root)
 
             downloader_stop = threading.Event()
             downloader_threads = max(1, int(self.cfg.get("downloader_threads", 4)))
+
+            # создаём YOLO очередь и воркеров, если включено
+            self.yolo_q = queue.Queue()
+            self.yolo_stop = threading.Event()
+            self.yolo_workers = []
+            if self.cfg.get("use_yolo", False):
+                yolo_workers_count = max(1, int(self.cfg.get("yolo_workers", 1)))
+                for _ in range(yolo_workers_count):
+                    w = YOLOWorker(
+                        self.yolo_q,
+                        self.yolo_stop,
+                        model_name=str(self.cfg.get("yolo_model", "yolov8n.pt")),
+                        conf=float(self.cfg.get("yolo_conf", 0.45)),
+                        crop=bool(self.cfg.get("yolo_crop", False)),
+                        full_body_ratio=float(self.cfg.get("full_body_ratio", 0.8))
+                    )
+                    w.start()
+                    self.yolo_workers.append(w)
+
+            # создаём downloaders и передаём одну и ту же yolo_q
             self._downloaders = []
             for _ in range(downloader_threads):
-                d = DownloaderThread(self._jobs_q, save_folder, self.seen_root, stop_event=downloader_stop)
+                d = DownloaderThread(
+                    self._jobs_q,
+                    save_folder,
+                    self.seen_root,
+                    stop_event=downloader_stop,
+                    yolo_q=self.yolo_q if self.cfg.get("use_yolo", False) else None
+                )
                 d.start()
                 self._downloaders.append(d)
-            
-            # partition tasks across feeder threads
-            feeder_threads = int(self.cfg.get("feeder_threads", 1))
-            chunks = [[] for _ in range(max(1, feeder_threads))]
+
+            # распределяем задачи по feeder-потокам
+            feeder_threads = max(1, int(self.cfg.get("feeder_threads", 1)))
+            chunks = [[] for _ in range(feeder_threads)]
             for i, t in enumerate(tasks):
-                chunks[i % len(chunks)].append(t)
+                chunks[i % feeder_threads].append(t)
+
             workers = []
             for chunk in chunks:
-                wt = threading.Thread(target=self._process_task_chunk, args=(chunk,), daemon=True)
+                wt = threading.Thread(
+                    target=self._process_task_chunk,
+                    args=(chunk,),
+                    daemon=True
+                )
                 workers.append(wt)
                 wt.start()
-            # monitor workers
+
+            # мониторим feeder-потоки
             while any(w.is_alive() for w in workers):
                 if self._stop.is_set():
                     break
                 time.sleep(0.5)
-            # wait until queue empty or stop
+
+            # ждём, пока очередь задач опустеет или будет стоп
             while not self._jobs_q.empty():
                 if self._stop.is_set():
                     break
                 time.sleep(0.3)
 
-            # stop downloader
+            # останавливаем downloaders
             downloader_stop.set()
             for d in getattr(self, "_downloaders", []):
                 try:
                     d.stop(wait=True)
                 except Exception:
                     pass
+
+            # останавливаем YOLO, если использовался
+            if self.cfg.get("use_yolo", False):
+                self.yolo_stop.set()
+                for w in self.yolo_workers:
+                    try:
+                        w.join(timeout=3)
+                    except Exception:
+                        pass
 
             self.progress_signal.emit(100)
             self.status_signal.emit("Completed")
@@ -973,6 +1216,7 @@ class ScraperThread(QThread):
             LOG.exception("ScraperThread run error")
             self.status_signal.emit("Error")
             self.done_signal.emit()
+
 
     def _process_task_chunk(self, chunk):
         total = len(chunk)
@@ -985,7 +1229,6 @@ class ScraperThread(QThread):
             self.status_signal.emit(f"Processing {source}: {query}")
             stop_ev = threading.Event()
             task_meta = {"pages": t.get("pages", 1), "imgs_per_page": t.get("imgs_per_page", 10), "count": t.get("count", 30)}
- # detailed downloader metadata passed into each enqueue job
             downloader_meta = {
                 "compute_hash": bool(self.cfg.get("dup_detection", False)),
                 "dup_detection": bool(self.cfg.get("dup_detection", False)),
@@ -1009,13 +1252,26 @@ class ScraperThread(QThread):
                     task_meta=task_meta,
                     downloader_meta=downloader_meta,
                     stop_event=stop_ev,
-                    logger=LOG
+                    logger=LOG,
+                    seen_cache=(self.seen_urls_global, self.seen_files_global, self.seen_hashes_global)
                 )
                 
             elif source == "bing":
-                th = BingScraperThread(query, self._jobs_q, t.get("folder"), self.seen_root, task_meta=task_meta, downloader_meta=downloader_meta, stop_event=stop_ev, logger=LOG)
+
+                th = BingScraperThread(
+                    query,
+                    self._jobs_q,
+                    t.get("folder"),
+                    self.seen_root,
+                    task_meta=task_meta,
+                    downloader_meta=downloader_meta,
+                    stop_event=stop_ev,
+                    logger=LOG,
+                    seen_cache=(self.seen_urls_global, self.seen_files_global, self.seen_hashes_global)
+                )
+                
             elif source == "pinterest":
-                th = PinterestScraperThread(query, self._jobs_q, t.get("folder"), self.seen_root, task_meta=task_meta, downloader_meta=downloader_meta, stop_event=stop_ev, logger=LOG, headless=self.cfg.get("pinterest_headless", True))
+                th = PinterestScraperThread(query, self._jobs_q, t.get("folder"), seen_cache=(self.seen_urls_global, self.seen_files_global, self.seen_hashes_global), task_meta=task_meta, downloader_meta=downloader_meta, stop_event=stop_ev, logger=LOG, headless=self.cfg.get("pinterest_headless", True))
             else:
                 continue
             self._scrapers.append((th, stop_ev))
@@ -1204,7 +1460,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Reference Scraper by Hara (modified and wrote by ChatGPT) for personal use")
         self.setGeometry(120, 120, 980, 760)
-
+        self._jobs_q = queue.Queue()
         self.settings = DEFAULT_SETTINGS.copy()
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -1691,8 +1947,27 @@ class MainWindow(QMainWindow):
             thread_cfg["pinterest_driver"] = self.pinterest_driver
             thread_cfg["pinterest_driver_lock"] = self.pinterest_driver_lock
         thread_cfg.update(self.settings)
+        out_folder = thread_cfg.get("save_folder", DEFAULT_SAVE_FOLDER)
+        ensure_folder(out_folder)
+        seen_folder = str(Path(out_folder) / ".seen")
+        ensure_folder(seen_folder)
+
+        self.scraper_thread = ScraperThread(
+            thread_cfg,
+            jobs_q=self._jobs_q,
+            out_folder=out_folder,
+            seen_folder=seen_folder
+        )
+
         ensure_folder(thread_cfg.get("save_folder", DEFAULT_SAVE_FOLDER))
-        self.scraper_thread = ScraperThread(thread_cfg)
+        ensure_folder(str(Path(thread_cfg.get("save_folder", DEFAULT_SAVE_FOLDER)) / ".seen"))
+
+        self.scraper_thread = ScraperThread(
+                thread_cfg,
+                jobs_q=self._jobs_q,
+                out_folder=thread_cfg.get("save_folder", DEFAULT_SAVE_FOLDER),
+                seen_folder=str(Path(thread_cfg.get("save_folder", DEFAULT_SAVE_FOLDER)) / ".seen")
+            )
         self.scraper_thread.status_signal.connect(self.status_label.setText)
         try:
             self.threads.append(self.scraper_thread)
@@ -1965,6 +2240,21 @@ class MainWindow(QMainWindow):
     def show_help_dialog(self):
     
         help_text = """
+
+        Версия: 2.4.1
+
+        /// 
+        
+        Основные изменения и улучшения:
+
+         - Исправление ошибок и багов
+         - Фильтрация до скачивания
+         - YOLO-потоки теперь не дублируются
+         - Меньше ресурсов для запуска .exe
+         - Защита от загрузки лишнего контента
+            
+        ///
+
         Версия: 2.0.1
 
         /// 
