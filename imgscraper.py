@@ -1,15 +1,5 @@
 # imgscraper.py
-"""
-ImgScraper — Updated with fixes requested:
-1) Restored and expanded POSE_TERMS to include many original categories.
-2) Improved Google/Bing parsing when given search queries (builds search URLs and parses results).
-3) Improved Pinterest parsing (more robust tab handling, scrolling, logging).
-4) Debug/logging: many more INFO/DEBUG logs emitted so Debug tab shows background actions (enqueue, saved, driver start/stop).
-5) Ensured threads receive task-specific params (pages, imgs_per_page).
-6) Proper closeEvent kept; lazy imports preserved.
 
-Replace your current imgscraper.py with this file.
-"""
 from pathlib import Path
 import os
 import sys
