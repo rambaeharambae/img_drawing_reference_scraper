@@ -35,7 +35,7 @@
 
            ⚡ Future improvements:
             - New classes to search (animals and items)
-            - Filter by precise poses and number of people
+            - Filter by precise poses and number of people in image
             - Pose estimation (Keypoint detection), checks that the frame contains visible limbs/pose
             - Automatic model selection: if the task is general, take the standard yolov8n.pt for speed, or yolov8m.pt for quality
             - Visualization and filter preview - open a window with examples of recognized frames, highlighted boxes and statistics (how many were filtered out, how many were left)
