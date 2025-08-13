@@ -387,31 +387,39 @@ class YOLOWorker(threading.Thread):
 
 
 class DownloaderThread(threading.Thread):
-
-    def __init__(
-        self,
-        jobs_q,
-        out_folder,
-        seen_folder,
-        stop_event=None,
-        yolo_q=None   # <--- новый аргумент
-    ):
+    def __init__(self,
+                 jobs_q,
+                 out_folder,
+                 seen_folder,
+                 stop_event=None,
+                 yolo_q=None,
+                 total_downloaded=None,
+                 total_lock=None,
+                 target_count=None):
         super().__init__(daemon=True)
         self.jobs_q = jobs_q
         self.out_folder = Path(out_folder)
         self.seen_folder = Path(seen_folder)
         self.stop_event = stop_event or threading.Event()
-        self.yolo_q = yolo_q  # <--- сохраняем в атрибут
+        self.yolo_q = yolo_q
+
         self._flush_interval = 15.0
         self._last_flush = time.time()
-        self._seen_urls, self._seen_files, self._seen_hashes = load_seen(self.seen_folder)
 
-        # фиксы для batch-хранилищ
+        # seen кэш
+        self.seen_urls, self.seen_files, self.seen_hashes = load_seen(self.seen_folder)
         self._batch_urls = set()
         self._batch_files = set()
-        self._batch_hashes = {}  # было set{}, теперь словарь
+        self._batch_hashes = {}
+
+        # общий счётчик и лимит
+        self.total_downloaded = total_downloaded if total_downloaded is not None else [0]
+        self.total_lock = total_lock if total_lock is not None else threading.Lock()
+        self.target_count = target_count
+
 
     def run(self):
+        
         LOG.info("Downloader started")
         # load seen once
         self.seen_urls, self.seen_files, self.seen_hashes = load_seen(str(self.seen_folder))
@@ -486,6 +494,12 @@ class DownloaderThread(threading.Thread):
                         except Exception as e:
                             LOG.warning("Failed to apply B/W filter to %s: %s", dest, e)
 
+                with self.total_lock:
+                    self.total_downloaded[0] += 1
+                    reached = (self.target_count is not None and self.total_downloaded[0] >= self.target_count)
+                if reached:
+                    self.stop_event.set()
+
                 if not ok:
                     LOG.debug("Failed to download %s", url)
                     try:
@@ -516,28 +530,45 @@ class DownloaderThread(threading.Thread):
                             LOG.debug("hash computation failed for %s", dest, exc_info=True)
 
                 # duplicate handling via pHash if enabled
+
                 if meta.get("dup_detection", False) and phash:
                     try:
-                        import imagehash
-                        # compute bit-length from current phash
+                        # длина хэша в битах
                         bits = len(phash) * 4
                         similarity = float(meta.get("dup_threshold", 0.8))
                         max_dist = int((1.0 - max(0.0, min(1.0, similarity))) * bits)
+
+                        # перевод текущего хэша в int для быстрой битовой разницы
+                        try:
+                            phash_int = int(phash, 16)
+                        except Exception:
+                            phash_int = None
+
                         is_dup = False
                         dup_existing_key = None
                         dup_existing_value = None
-                        for existing_hex, existing_value in list(self.seen_hashes.items()):
-                            try:
-                                ha = imagehash.hex_to_hash(existing_hex)
-                                hb = imagehash.hex_to_hash(phash)
-                                dist = ha - hb
-                            except Exception:
+
+                        if phash_int is not None:
+                            for existing_hex, existing_value in list(self.seen_hashes.items()):
+                                try:
+                                    existing_int = int(existing_hex, 16)
+                                except Exception:
+                                    continue
+                                dist = (existing_int ^ phash_int).bit_count()
+                                if dist <= max_dist:
+                                    is_dup = True
+                                    dup_existing_key = existing_hex
+                                    dup_existing_value = existing_value
+                                    break
+                        else:
+                            # fallback на посимвольное сравнение
+                            for existing_hex, existing_value in list(self.seen_hashes.items()):
                                 dist = sum(c1 != c2 for c1, c2 in zip(existing_hex, phash))
-                            if dist <= max_dist:
-                                is_dup = True
-                                dup_existing_key = existing_hex
-                                dup_existing_value = existing_value
-                                break
+                                if dist <= max_dist:
+                                    is_dup = True
+                                    dup_existing_key = existing_hex
+                                    dup_existing_value = existing_value
+                                    break
 
                         if is_dup:
                             action = str(meta.get("dup_action", "delete_new"))
@@ -550,7 +581,6 @@ class DownloaderThread(threading.Thread):
                                 ok = False
                             elif action == "replace_existing" and dup_existing_value:
                                 try:
-                                    # dup_existing_value may be full path or filename.
                                     existing_path = _resolve_existing_path(dup_existing_value)
                                     if existing_path and existing_path.exists():
                                         try:
@@ -558,20 +588,19 @@ class DownloaderThread(threading.Thread):
                                             LOG.info("Removed existing duplicate: %s", existing_path)
                                         except Exception:
                                             LOG.debug("Failed to remove existing duplicate %s", existing_path, exc_info=True)
-                                    # remove mapping entry
                                     try:
                                         del self.seen_hashes[dup_existing_key]
                                     except Exception:
                                         pass
                                 except Exception:
                                     LOG.debug("Failed replace_existing cleanup", exc_info=True)
-                                # ok remains True; new file will be recorded
                             elif action == "keep_both":
                                 LOG.info("Keeping both duplicates: %s", dest.name)
                             else:
                                 LOG.debug("Unknown dup action %s", action)
                     except Exception:
                         LOG.debug("Duplicate detection error for %s", dest, exc_info=True)
+
 
                 # finalize saved file bookkeeping
                 if ok:
@@ -760,7 +789,7 @@ class BaseScraperThread(threading.Thread):
         self.logger.info("Enqueued %s -> %s", url, dest)
 
     def stop(self):
-        self.stop_event.set()
+        self._stop.set()
 
 
 
@@ -794,12 +823,14 @@ class GoogleScraperThread(BaseScraperThread):
                     if any(url_l.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
                         return True
                     # best-effort HEAD fallback
+                    '''
                     try:
                         r = requests.head(url, allow_redirects=True, timeout=5)
                         ct = r.headers.get("Content-Type", "")
                         return ct.startswith("image/")
                     except Exception:
                         return False
+                    '''
 
                 if not is_image_url(url):
                     LOG.debug("Skipped non-image URL: %s", url)
@@ -870,12 +901,14 @@ class BingScraperThread(BaseScraperThread):
                     if any(url_l.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
                         return True
                     # best-effort HEAD fallback
+                    '''
                     try:
                         r = requests.head(url, allow_redirects=True, timeout=5)
                         ct = r.headers.get("Content-Type", "")
                         return ct.startswith("image/")
                     except Exception:
                         return False
+                    '''
 
                 if not is_image_url(url):
                     LOG.debug("Skipped non-image URL: %s", url)
@@ -922,7 +955,7 @@ class PinterestScraperThread(BaseScraperThread):
         jobs_q,
         out_folder,
         seen_folder=None,
-        seen_cache=None,  # <--- добавили
+        seen_cache=None,
         task_meta=None,
         downloader_meta=None,
         stop_event=None,
@@ -935,7 +968,7 @@ class PinterestScraperThread(BaseScraperThread):
             jobs_q,
             out_folder,
             seen_folder,
-            seen_cache=seen_cache,  # <--- проброс в базовый класс
+            seen_cache=seen_cache,
             task_meta=task_meta,
             downloader_meta=downloader_meta,
             stop_event=stop_event,
@@ -955,22 +988,14 @@ class PinterestScraperThread(BaseScraperThread):
             raise RuntimeError("Selenium/webdriver_manager required: " + str(e))
 
         opts = Options()
-
-        # Headless
         if self.headless:
             try:
                 opts.add_argument('--headless=new')
             except Exception:
                 opts.add_argument('--headless')
-
-        # Минимальное окно
         opts.add_argument("--window-size=800,600")
-
-        # Отключение изображений для ускорения загрузки страниц
         prefs = {"profile.managed_default_content_settings.images": 2}
         opts.add_experimental_option("prefs", prefs)
-
-        # Прочие оптимизации
         opts.add_argument('--no-sandbox')
         opts.add_argument('--disable-dev-shm-usage')
         opts.add_argument('--log-level=3')
@@ -992,7 +1017,6 @@ class PinterestScraperThread(BaseScraperThread):
         self.driver = driver
         return driver
 
-
     def run(self):
         self.logger.info("PinterestScraper started for %s", self.query_or_url)
         try:
@@ -1004,16 +1028,18 @@ class PinterestScraperThread(BaseScraperThread):
                 target = f"https://www.pinterest.com/search/pins/?q={q}"
             self.logger.info("Pinterest: opening %s", target)
             driver.get(target)
-            WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/pin/']")))
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/pin/']"))
+            )
 
             collected = []
             scroll_attempts = 0
-            
             target_count = int(self.task_meta.get("count") or self.task_meta.get("imgs_per_page") or 20)
             max_scrolls = max(10, int(target_count / self.imgs_per_page) * 5)
+
             while not self.stop_event.is_set() and len(collected) < target_count and scroll_attempts < max_scrolls:
                 try:
-                    thumbs = driver.find_elements("css selector", "a[href*='/pin/']")
+                    thumbs = driver.find_elements(By.CSS_SELECTOR, "a[href*='/pin/']")
                     for el in thumbs:
                         try:
                             href = el.get_attribute("href")
@@ -1021,16 +1047,20 @@ class PinterestScraperThread(BaseScraperThread):
                                 collected.append(href)
                         except Exception:
                             continue
-                    driver.execute_script("window.scrollBy(0, window.innerHeight);")
-                    WebDriverWait(driver, 4).until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "a[href*='/pin/']")) > 0)
+                    if len(thumbs) > 0:
+                        driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                    else:
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(0.3)
                     scroll_attempts += 1
                 except Exception:
                     LOG.debug("Pinterest scroll iteration error", exc_info=True)
-                    time.sleep(0.5)
-            self.logger.info("Pinterest: collected %d pin links", len(collected))
+                    time.sleep(0.3)
 
+            self.logger.info("Pinterest: collected %d pin links", len(collected))
             enqueued = 0
-            for pin_url in list(collected)[:target_count]:
+
+            for pin_url in collected[:target_count]:
                 if self.stop_event.is_set():
                     break
                 try:
@@ -1046,32 +1076,52 @@ class PinterestScraperThread(BaseScraperThread):
                             new_handle = new[0]
                             break
                         time.sleep(0.15)
+
                     if new_handle:
                         driver.switch_to.window(new_handle)
                     else:
                         driver.get(pin_url)
-                    time.sleep(0.8)
-                    imgs = driver.find_elements("css selector", "img")
-                    img_url = None
-                    for im in imgs:
-                        try:
-                            s = im.get_attribute("src")
-                            if not s:
-                                s = im.get_attribute("data-src") or im.get_attribute("data-original") or im.get_attribute("srcset")
-                            if s and "pinimg" in s:
-                                img_url = s
-                                break
-                            if s and s.startswith("http") and any(ext in s for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                                if not img_url:
+                    try:
+                        WebDriverWait(driver, 3).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='pinimg'], img[data-src*='pinimg'], img[srcset*='pinimg']"))
+                        )
+                    except Exception:
+                        pass
+                    imgs = driver.find_elements(By.CSS_SELECTOR, "img")
+
+                    # Fallback через og:image
+                    try:
+                        og = driver.find_element(By.CSS_SELECTOR, "meta[property='og:image']")
+                        cand = og.get_attribute("content")
+                        if cand and "pinimg" in cand:
+                            img_url = cand
+                    except Exception:
+                        pass
+
+                    # Поиск в img и srcset
+                    if not img_url:
+                        imgs = driver.find_elements(By.CSS_SELECTOR, "img")
+                        for im in imgs:
+                            try:
+                                s = im.get_attribute("src") or im.get_attribute("data-src") or im.get_attribute("data-original")
+                                if not s:
+                                    srcset = im.get_attribute("srcset")
+                                    if srcset and "pinimg" in srcset:
+                                        s = sorted([u.strip().split(" ")[0] for u in srcset.split(",") if "pinimg" in u], key=len)[-1]
+                                if s and "pinimg" in s:
                                     img_url = s
-                        except Exception:
-                            continue
+                                    break
+                            except Exception:
+                                continue
+
                     if img_url:
                         self._enqueue_with_min_size_check(img_url)
                         enqueued += 1
+
                     if new_handle:
                         driver.close()
                         driver.switch_to.window(cur_handle)
+
                 except Exception:
                     LOG.debug("Pinterest per-pin handling error", exc_info=True)
                     try:
@@ -1080,22 +1130,31 @@ class PinterestScraperThread(BaseScraperThread):
                             driver.switch_to.window(driver.window_handles[0])
                     except Exception:
                         pass
+
             self.logger.info("PinterestScraper enqueued %d items", enqueued)
         except Exception:
             self.logger.exception("PinterestScraper failed")
         self.logger.info("PinterestScraper finished for %s", self.query_or_url)
-    
+
+
     def _enqueue_with_min_size_check(self, url):
         try:
             import requests
             r = requests.head(url, allow_redirects=True, timeout=5)
-            size = int(r.headers.get('Content-Length', 0))
-            if size < 10240:
-                LOG.info("Skipped too small file (<10KB): %s", url)
-                return
+            size_hdr = r.headers.get('Content-Length')
+            if size_hdr:
+                try:
+                    size = int(size_hdr)
+                    if size < 10240:
+                        LOG.info("Skipped too small file (<10KB): %s", url)
+                        return
+                except Exception:
+                    pass
         except Exception:
             LOG.debug("Could not check size for %s", url, exc_info=True)
         self._enqueue(url)
+
+
 
 # ---------------------------
 # ScraperThread QThread orchestrator
@@ -1105,13 +1164,27 @@ class ScraperThread(QThread):
     progress_signal = pyqtSignal(int)
     done_signal = pyqtSignal()
 
-    def __init__(self, cfg, jobs_q, out_folder, seen_folder, stop_event=None, yolo_q=None):
+    def __init__(self, cfg, jobs_q, out_folder, seen_folder, tasks=None, stop_event=None, yolo_q=None):
         super().__init__()
         self.cfg = cfg.copy()
         self._stop = threading.Event()
         self._scrapers = []
-        self._jobs_q = queue.Queue()
+        self._jobs_q = jobs_q  # используем переданную очередь, не затираем новой
+        self.out_folder = Path(out_folder)
+        self.seen_folder = Path(seen_folder)
         self.yolo_q = yolo_q
+        self.stop_event = stop_event or threading.Event()
+
+        # Список заданий (если передан)
+        self.tasks = tasks or []
+
+        # Счётчик и блокировка для автоостановки
+        self.total_downloaded = [0]  # общий счётчик в виде списка
+        self.total_lock = threading.Lock()
+
+        # Лимит по количеству картинок
+        self.target_count = sum(t.get("count", 0) for t in self.tasks) if self.tasks else None
+
 
     def run(self):
         try:
@@ -1129,8 +1202,10 @@ class ScraperThread(QThread):
             ensure_folder(self.seen_root)
             self.seen_urls_global, self.seen_files_global, self.seen_hashes_global = load_seen(self.seen_root)
 
-            downloader_stop = threading.Event()
-            downloader_threads = max(1, int(self.cfg.get("downloader_threads", 4)))
+            # Общие объекты для подсчёта
+            self.total_downloaded = [0]  # общий счётчик в виде списка
+            self.total_lock = threading.Lock()
+            self.target_count = sum(t.get("count", 0) for t in tasks) if tasks else None
 
             # создаём YOLO очередь и воркеров, если включено
             self.yolo_q = queue.Queue()
@@ -1152,13 +1227,17 @@ class ScraperThread(QThread):
 
             # создаём downloaders и передаём одну и ту же yolo_q
             self._downloaders = []
+            downloader_threads = max(1, int(self.cfg.get("downloader_threads", 2)))
             for _ in range(downloader_threads):
                 d = DownloaderThread(
-                    self._jobs_q,
-                    save_folder,
-                    self.seen_root,
-                    stop_event=downloader_stop,
-                    yolo_q=self.yolo_q if self.cfg.get("use_yolo", False) else None
+                    jobs_q=self._jobs_q,
+                    out_folder=save_folder,
+                    seen_folder=self.seen_root,
+                    stop_event=self._stop,
+                    yolo_q=self.yolo_q,
+                    total_downloaded=self.total_downloaded,
+                    total_lock=self.total_lock,
+                    target_count=self.target_count
                 )
                 d.start()
                 self._downloaders.append(d)
@@ -1192,7 +1271,6 @@ class ScraperThread(QThread):
                 time.sleep(0.3)
 
             # останавливаем downloaders
-            downloader_stop.set()
             for d in getattr(self, "_downloaders", []):
                 try:
                     d.stop(wait=True)
@@ -1217,8 +1295,9 @@ class ScraperThread(QThread):
             self.status_signal.emit("Error")
             self.done_signal.emit()
 
-
     def _process_task_chunk(self, chunk):
+        seen_keys = set()
+        chunk = [t for t in chunk if not (t["source"], t["query"]) in seen_keys and not seen_keys.add((t["source"], t["query"]))]
         total = len(chunk)
         done = 0
         for t in chunk:
@@ -2241,6 +2320,16 @@ class MainWindow(QMainWindow):
     
         help_text = """
 
+        Версия: 2.5.5
+
+        /// 
+        
+        Основные изменения и улучшения:
+
+         - Исправление ошибок и багов при парсинге Pinterest
+            
+        ///
+        
         Версия: 2.4.1
 
         /// 
